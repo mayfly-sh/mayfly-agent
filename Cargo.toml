@@ -1,0 +1,59 @@
+[package]
+name = "mayfly-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Security-first Linux daemon that manages OpenSSH TrustedUserCAKeys for Mayfly."
+license = "MPL-2.0"
+repository = "https://github.com/mayfly/mayfly-agent"
+authors = ["Mayfly Authors"]
+readme = "README.md"
+
+[lib]
+name = "mayfly_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mayfly-agent"
+path = "src/main.rs"
+
+# Hard dependency rules for this security product:
+#   * Pure Rust only. No OpenSSL, no native-tls, no C TLS stack.
+#   * Must build for x86_64, aarch64, armv7 and armv6 Linux targets.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "fmt",
+    "env-filter",
+    "ansi",
+    "json",
+    "registry",
+] }
+time = { version = "0.3", features = ["macros"] }
+rustix = { version = "1", features = ["process"] }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
