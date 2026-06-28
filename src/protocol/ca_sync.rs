@@ -147,22 +147,32 @@ impl SshdReloader for SystemdSshdReloader {
     }
 }
 
+/// Status values the agent reports in an [`AckReport`].
+///
+/// These are the exact wire strings the server's `AckOutcome::parse` accepts:
+/// a successful apply advances the server's `synced_generation`, while a
+/// rollback is audited without advancing it.
+const ACK_STATUS_APPLIED: &str = "applied";
+const ACK_STATUS_ROLLBACK: &str = "rollback";
+
 /// The acknowledgement reported to the server after a sync pass.
 ///
-/// `error`, when present, is a fixed agent-controlled string — never a path or
-/// secret — so it is safe to transmit.
+/// This is the wire body of `POST /api/v1/agent/ca-bundle/ack` and matches the
+/// server's `BundleAckRequest` field-for-field. `reason`, when present, is a
+/// fixed agent-controlled string — never a path or secret — so it is safe to
+/// transmit; it is omitted entirely on success.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AckReport {
     /// The generation the pass concerned.
     pub generation: u64,
     /// The bundle fingerprint the pass concerned.
     pub fingerprint: String,
-    /// Whether the new bundle was applied (file replaced and reload verified).
-    pub applied: bool,
-    /// Whether the `sshd` reload was verified successful.
-    pub reload_success: bool,
-    /// A fixed, non-sensitive failure description, if the pass failed.
-    pub error: Option<String>,
+    /// Outcome status: `applied` (file replaced and reload verified) or
+    /// `rollback` (apply failed and the previous bundle was restored).
+    pub status: String,
+    /// A fixed, non-sensitive detail string, omitted on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The result of a single synchronisation pass.
@@ -342,9 +352,8 @@ impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
                 let report = AckReport {
                     generation: bundle.generation(),
                     fingerprint: bundle.fingerprint().to_string(),
-                    applied: true,
-                    reload_success: true,
-                    error: None,
+                    status: ACK_STATUS_APPLIED.to_string(),
+                    reason: None,
                 };
                 let acknowledged = self.acknowledge(&report);
                 Ok(SyncOutcome::Updated {
@@ -362,9 +371,8 @@ impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
                 let report = AckReport {
                     generation: bundle.generation(),
                     fingerprint: bundle.fingerprint().to_string(),
-                    applied: false,
-                    reload_success: false,
-                    error: Some(error.to_string()),
+                    status: ACK_STATUS_ROLLBACK.to_string(),
+                    reason: Some(error.to_string()),
                 };
                 // Report failure but never claim success.
                 let _ = self.acknowledge(&report);

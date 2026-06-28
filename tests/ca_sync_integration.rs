@@ -271,7 +271,7 @@ fn full_lifecycle_download_verify_apply_ack_then_304_then_update() {
         .last_ack
         .as_ref()
         .unwrap()
-        .contains("\"applied\":true"));
+        .contains("\"status\":\"applied\""));
 
     // 2) Same generation -> server answers 304 (ETag match), nothing changes.
     let outcome = fx.service().synchronize().unwrap();

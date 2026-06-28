@@ -306,9 +306,10 @@ fn updates_on_new_signed_bundle_and_acks() {
     // Ack body carries the full status report.
     let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
     let body = String::from_utf8(ack.body).unwrap();
-    assert!(body.contains("\"applied\":true"));
-    assert!(body.contains("\"reload_success\":true"));
+    assert!(body.contains("\"status\":\"applied\""));
     assert!(body.contains("\"generation\":42"));
+    // A successful apply omits the reason entirely.
+    assert!(!body.contains("\"reason\""));
 }
 
 #[test]
@@ -436,11 +437,10 @@ fn rolls_back_on_reload_failure() {
     // Reload attempted twice: once for the new file, once after restoring.
     assert_eq!(service.reloader.reloads(), 2);
 
-    // A failure ack was still reported (applied=false), and rollback succeeded.
+    // A failure ack was still reported (status=rollback), and rollback succeeded.
     let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
     let body = String::from_utf8(ack.body).unwrap();
-    assert!(body.contains("\"applied\":false"));
-    assert!(body.contains("\"reload_success\":false"));
+    assert!(body.contains("\"status\":\"rollback\""));
     assert!(body.contains("previous bundle restored"));
 }
 
@@ -486,7 +486,7 @@ fn reports_rollback_failure_when_sshd_permanently_broken() {
     // The ack must NOT claim success; it reports the rollback could not complete.
     let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
     let body = String::from_utf8(ack.body).unwrap();
-    assert!(body.contains("\"applied\":false"));
+    assert!(body.contains("\"status\":\"rollback\""));
     assert!(body.contains("rollback also failed"));
 }
 
@@ -652,5 +652,34 @@ fn join_url_avoids_double_slash() {
     assert_eq!(
         super::join_url("https://h/", CA_BUNDLE_PATH),
         "https://h/api/v1/agent/ca-bundle"
+    );
+}
+
+/// GOLDEN (ack wire shape): the agent serializes an applied ack with exactly
+/// `generation`, `fingerprint`, `status` and omits `reason`; a rollback ack adds
+/// `reason`. These bytes must deserialize into the server's `BundleAckRequest`.
+#[test]
+fn ack_report_serializes_to_server_schema() {
+    let applied = AckReport {
+        generation: 42,
+        fingerprint: "sha256:ab".to_string(),
+        status: "applied".to_string(),
+        reason: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&applied).unwrap(),
+        "{\"generation\":42,\"fingerprint\":\"sha256:ab\",\"status\":\"applied\"}"
+    );
+
+    let rollback = AckReport {
+        generation: 42,
+        fingerprint: "sha256:ab".to_string(),
+        status: "rollback".to_string(),
+        reason: Some("sshd reload failed; previous bundle restored".to_string()),
+    };
+    assert_eq!(
+        serde_json::to_string(&rollback).unwrap(),
+        "{\"generation\":42,\"fingerprint\":\"sha256:ab\",\"status\":\"rollback\",\
+\"reason\":\"sshd reload failed; previous bundle restored\"}"
     );
 }
