@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "json",
     "registry",
 ] }
-time = { version = "0.3", features = ["macros"] }
+time = { version = "0.3", features = ["macros", "formatting", "parsing"] }
 rustix = { version = "1", features = ["process"] }
 tempfile = "3"
 # Pure-Rust (RustCrypto) Ed25519 + OpenSSH key handling. No OpenSSL, no ssh-keygen.

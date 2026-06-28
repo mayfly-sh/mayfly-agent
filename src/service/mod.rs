@@ -6,5 +6,10 @@
 //! and CA management are implemented in later phases.
 
 pub mod agent;
+pub mod scheduler;
 
 pub use agent::Agent;
+pub use scheduler::{
+    run_polling, FixedRandom, JitteredInterval, OsRandom, PollAction, RandomSource, Scheduler,
+    Sleeper, ThreadSleeper,
+};

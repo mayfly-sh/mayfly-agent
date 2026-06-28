@@ -32,8 +32,26 @@ const DEFAULT_SYNC_SECS: u64 = 300;
 const MIN_INTERVAL_SECS: u64 = 1;
 const MAX_INTERVAL_SECS: u64 = 86_400;
 const MAX_MACHINE_ID_LEN: usize = 128;
-const DEFAULT_TRUSTED_CA_PATH: &str = "/etc/ssh/mayfly_ca.pub";
+const DEFAULT_TRUSTED_CA_PATH: &str = "/etc/ssh/mayfly/trusted_user_ca_keys";
 const DEFAULT_SSHD_CONFIG_PATH: &str = "/etc/ssh/sshd_config.d/mayfly.conf";
+const DEFAULT_STATE_DIR: &str = "/var/lib/mayfly";
+
+/// File name (under `state_dir`) holding the last-applied bundle generation.
+pub const GENERATION_FILE: &str = "current_generation";
+/// File name (under `state_dir`) holding the last-applied bundle fingerprint.
+pub const BUNDLE_FINGERPRINT_FILE: &str = "current_bundle.sha256";
+/// File name (under `state_dir`) holding the timestamp of the last sync attempt
+/// that reached the server (RFC 3339).
+pub const LAST_SYNC_FILE: &str = "last_sync";
+/// File name (under `state_dir`) holding the timestamp of the last successful
+/// application (RFC 3339).
+pub const LAST_SUCCESS_FILE: &str = "last_success";
+/// File name (under `state_dir`) holding the pinned bundle-signing public key
+/// (OpenSSH Ed25519 line) established on first contact.
+pub const SIGNING_KEY_FILE: &str = "bundle_signing_key.pub";
+
+/// Default jitter ratio applied to poll intervals (10%).
+const DEFAULT_POLL_JITTER_RATIO: f64 = 0.10;
 
 /// Logging verbosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -100,7 +118,7 @@ impl LogFormat {
 }
 
 /// The fully merged, validated agent configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Base URL of the Mayfly server. Must be `https://` unless
@@ -125,6 +143,26 @@ pub struct Config {
     /// Absolute path to the managed sshd configuration drop-in.
     #[serde(default = "default_sshd_config_path")]
     pub sshd_config_path: PathBuf,
+
+    /// Absolute path to the daemon's mutable state directory. Holds the
+    /// persisted CA-bundle generation and fingerprint metadata.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: PathBuf,
+
+    /// Operator-provisioned bundle-signing public key (OpenSSH Ed25519 line).
+    ///
+    /// When set, this is the trust anchor for bundle signatures: a bundle whose
+    /// `bundle_signing_public_key` differs from this value is rejected. When
+    /// unset, the agent pins the first key it sees (trust-on-first-use) under
+    /// [`Config::bundle_signing_key_path`].
+    #[serde(default)]
+    pub bundle_signing_public_key: Option<String>,
+
+    /// Fractional jitter applied to poll intervals, in `[0.0, 1.0]`. A value of
+    /// `0.1` spreads polls across up to +10% of the base interval to avoid
+    /// thundering-herd alignment across a fleet.
+    #[serde(default = "default_poll_jitter_ratio")]
+    pub poll_jitter_ratio: f64,
 
     /// Logging verbosity.
     #[serde(default)]
@@ -153,6 +191,14 @@ fn default_trusted_ca_path() -> PathBuf {
 
 fn default_sshd_config_path() -> PathBuf {
     PathBuf::from(DEFAULT_SSHD_CONFIG_PATH)
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_STATE_DIR)
+}
+
+fn default_poll_jitter_ratio() -> f64 {
+    DEFAULT_POLL_JITTER_RATIO
 }
 
 impl Config {
@@ -212,6 +258,20 @@ impl Config {
         if let Some(v) = get_env(&key("SSHD_CONFIG_PATH")) {
             self.sshd_config_path = PathBuf::from(v);
         }
+        if let Some(v) = get_env(&key("STATE_DIR")) {
+            self.state_dir = PathBuf::from(v);
+        }
+        if let Some(v) = get_env(&key("BUNDLE_SIGNING_PUBLIC_KEY")) {
+            let trimmed = v.trim();
+            self.bundle_signing_public_key = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Some(v) = get_env(&key("POLL_JITTER_RATIO")) {
+            self.poll_jitter_ratio = parse_f64("poll_jitter_ratio", &v)?;
+        }
         if let Some(v) = get_env(&key("LOG_LEVEL")) {
             self.log_level = LogLevel::parse(&v)
                 .ok_or_else(|| Error::config_invalid("log_level is not a valid level"))?;
@@ -238,6 +298,9 @@ impl Config {
         validate_interval("sync_interval", self.sync_interval)?;
         validate_managed_path("trusted_ca_path", &self.trusted_ca_path)?;
         validate_managed_path("sshd_config_path", &self.sshd_config_path)?;
+        validate_managed_path("state_dir", &self.state_dir)?;
+        validate_jitter_ratio(self.poll_jitter_ratio)?;
+        validate_optional_signing_key(self.bundle_signing_public_key.as_deref())?;
 
         if self.allow_insecure_tls {
             tracing::warn!(
@@ -245,6 +308,31 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// Absolute path to the file storing the last-applied bundle generation.
+    pub fn generation_path(&self) -> PathBuf {
+        self.state_dir.join(GENERATION_FILE)
+    }
+
+    /// Absolute path to the file storing the last-applied bundle fingerprint.
+    pub fn bundle_fingerprint_path(&self) -> PathBuf {
+        self.state_dir.join(BUNDLE_FINGERPRINT_FILE)
+    }
+
+    /// Absolute path to the file storing the last sync-attempt timestamp.
+    pub fn last_sync_path(&self) -> PathBuf {
+        self.state_dir.join(LAST_SYNC_FILE)
+    }
+
+    /// Absolute path to the file storing the last successful-apply timestamp.
+    pub fn last_success_path(&self) -> PathBuf {
+        self.state_dir.join(LAST_SUCCESS_FILE)
+    }
+
+    /// Absolute path to the file storing the pinned bundle-signing public key.
+    pub fn bundle_signing_key_path(&self) -> PathBuf {
+        self.state_dir.join(SIGNING_KEY_FILE)
     }
 
     fn validate_server_url(&self) -> Result<()> {
@@ -297,6 +385,33 @@ fn parse_bool(field: &'static str, value: &str) -> Result<bool> {
         "false" | "0" | "no" | "off" => Ok(false),
         _ => Err(Error::config_invalid(format!("{field} must be a boolean"))),
     }
+}
+
+fn parse_f64(field: &'static str, value: &str) -> Result<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| Error::config_invalid(format!("{field} must be a number")))
+}
+
+fn validate_jitter_ratio(ratio: f64) -> Result<()> {
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return Err(Error::config_invalid(
+            "poll_jitter_ratio must be between 0.0 and 1.0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_signing_key(key: Option<&str>) -> Result<()> {
+    let Some(key) = key else { return Ok(()) };
+    if key.trim().is_empty() {
+        return Err(Error::config_invalid(
+            "bundle_signing_public_key must not be empty when set",
+        ));
+    }
+    crate::identity::keypair::validate_ed25519_public_key(key)
+        .map_err(|_| Error::config_invalid("bundle_signing_public_key is not a valid Ed25519 key"))
 }
 
 fn validate_machine_id(machine_id: &str) -> Result<()> {
@@ -401,9 +516,58 @@ mod tests {
             cfg.sshd_config_path,
             PathBuf::from(DEFAULT_SSHD_CONFIG_PATH)
         );
+        assert_eq!(cfg.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
+        assert_eq!(
+            cfg.generation_path(),
+            PathBuf::from("/var/lib/mayfly/current_generation")
+        );
+        assert_eq!(
+            cfg.bundle_fingerprint_path(),
+            PathBuf::from("/var/lib/mayfly/current_bundle.sha256")
+        );
+        assert_eq!(
+            cfg.last_sync_path(),
+            PathBuf::from("/var/lib/mayfly/last_sync")
+        );
+        assert_eq!(
+            cfg.last_success_path(),
+            PathBuf::from("/var/lib/mayfly/last_success")
+        );
+        assert_eq!(
+            cfg.bundle_signing_key_path(),
+            PathBuf::from("/var/lib/mayfly/bundle_signing_key.pub")
+        );
+        assert_eq!(cfg.bundle_signing_public_key, None);
+        assert!((cfg.poll_jitter_ratio - DEFAULT_POLL_JITTER_RATIO).abs() < f64::EPSILON);
         assert_eq!(cfg.log_level, LogLevel::Info);
         assert_eq!(cfg.log_format, LogFormat::Json);
         assert!(!cfg.allow_insecure_tls);
+    }
+
+    #[test]
+    fn rejects_out_of_range_jitter_ratio() {
+        let toml = format!("{MINIMAL}\npoll_jitter_ratio = 1.5\n");
+        assert!(matches!(load(&toml).unwrap_err(), Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_signing_key() {
+        let toml = format!("{MINIMAL}\nbundle_signing_public_key = \"not-a-key\"\n");
+        assert!(matches!(load(&toml).unwrap_err(), Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn accepts_valid_pinned_signing_key() {
+        let key = crate::identity::keypair::MachineKeypair::generate()
+            .unwrap()
+            .public_key_openssh()
+            .unwrap();
+        let toml = format!(
+            "{MINIMAL}\nbundle_signing_public_key = \"{}\"\n",
+            key.trim()
+        );
+        let cfg = load(&toml).unwrap();
+        assert_eq!(cfg.bundle_signing_public_key.as_deref(), Some(key.trim()));
     }
 
     #[test]
@@ -415,6 +579,7 @@ mod tests {
             sync_interval = 120
             trusted_ca_path = "/etc/ssh/custom_ca.pub"
             sshd_config_path = "/etc/ssh/sshd_config.d/custom.conf"
+            state_dir = "/var/lib/custom-mayfly"
             log_level = "debug"
             log_format = "pretty"
             allow_insecure_tls = false
@@ -423,6 +588,7 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(15));
         assert_eq!(cfg.sync_interval, Duration::from_secs(120));
         assert_eq!(cfg.trusted_ca_path, PathBuf::from("/etc/ssh/custom_ca.pub"));
+        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/custom-mayfly"));
         assert_eq!(cfg.log_level, LogLevel::Debug);
         assert_eq!(cfg.log_format, LogFormat::Pretty);
     }

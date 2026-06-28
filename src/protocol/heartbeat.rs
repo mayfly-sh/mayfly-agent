@@ -111,6 +111,14 @@ impl ReqwestTransport {
     }
 }
 
+impl ReqwestTransport {
+    /// Borrow the underlying blocking client so sibling transports (e.g. the CA
+    /// bundle transport) can reuse the same connection pool and TLS config.
+    pub(crate) fn client(&self) -> &reqwest::blocking::Client {
+        &self.client
+    }
+}
+
 impl HeartbeatTransport for ReqwestTransport {
     fn post(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let mut builder = self.client.post(&request.url).body(request.body.clone());

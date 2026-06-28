@@ -140,6 +140,24 @@ pub enum Error {
     #[error("untrusted heartbeat response")]
     InvalidHeartbeatResponse,
 
+    /// Communication with the server while synchronising the CA bundle failed.
+    #[error("failed to communicate with the CA bundle server")]
+    CaBundleTransport,
+
+    /// The server rejected a CA bundle request (non-success, non-304 status).
+    #[error("server rejected the CA bundle request")]
+    CaBundleRejected,
+
+    /// A CA bundle response failed validation. The reason is a fixed enum, so
+    /// no server-controlled data reaches the message.
+    #[error("untrusted CA bundle: {0}")]
+    InvalidCaBundle(CaBundleError),
+
+    /// Reloading `sshd` after writing a new bundle failed; the previous bundle
+    /// was restored. The path is logged, never included here.
+    #[error("failed to reload sshd; previous CA bundle was restored")]
+    CaReloadFailed,
+
     /// The persisted machine record could not be parsed.
     #[error("failed to parse machine record")]
     MachineRecordParse(#[source] serde_json::Error),
@@ -224,6 +242,69 @@ impl fmt::Display for TrustedCaError {
     }
 }
 
+/// Fixed, non-sensitive reasons a CA bundle response can be rejected.
+///
+/// A closed enum keeps rejection reasons auditable and guarantees no
+/// server-controlled string is interpolated into an error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaBundleError {
+    /// The bundle contained zero keys.
+    Empty,
+    /// The bundle contained more than the permitted maximum number of keys.
+    TooManyKeys,
+    /// Two keys shared a `key_id`.
+    DuplicateKeyId,
+    /// Two keys shared a public key.
+    DuplicatePublicKey,
+    /// A key was malformed, used a disallowed algorithm, or was not Ed25519.
+    InvalidKey,
+    /// The `generation` field was missing or not a positive integer.
+    MissingGeneration,
+    /// The `fingerprint` field was missing or empty.
+    MissingFingerprint,
+    /// The recomputed fingerprint did not match the advertised one.
+    FingerprintMismatch,
+    /// The `bundle_version` is absent or not a version this agent supports.
+    UnsupportedVersion,
+    /// The `signature_algorithm` is not one this agent accepts.
+    UnsupportedSignatureAlgorithm,
+    /// A `created_at`/`expires_at` timestamp was missing or unparseable.
+    InvalidTimestamp,
+    /// The bundle's validity window has elapsed (`expires_at` is in the past).
+    Expired,
+    /// The detached bundle signature did not verify against the signing key.
+    SignatureInvalid,
+    /// The bundle signing key differs from the pinned/expected signing key.
+    SigningKeyMismatch,
+    /// The advertised generation is older than the one already applied
+    /// (a downgrade / rollback attack).
+    GenerationRegressed,
+}
+
+impl fmt::Display for CaBundleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            Self::Empty => "bundle contains no keys",
+            Self::TooManyKeys => "bundle contains too many keys",
+            Self::DuplicateKeyId => "bundle contains a duplicate key id",
+            Self::DuplicatePublicKey => "bundle contains a duplicate public key",
+            Self::InvalidKey => "bundle contains an invalid key",
+            Self::MissingGeneration => "bundle generation is missing or invalid",
+            Self::MissingFingerprint => "bundle fingerprint is missing",
+            Self::FingerprintMismatch => "bundle fingerprint does not match its contents",
+            Self::UnsupportedVersion => "bundle version is not supported",
+            Self::UnsupportedSignatureAlgorithm => "bundle signature algorithm is not supported",
+            Self::InvalidTimestamp => "bundle timestamp is missing or invalid",
+            Self::Expired => "bundle has expired",
+            Self::SignatureInvalid => "bundle signature failed verification",
+            Self::SigningKeyMismatch => "bundle signing key does not match the pinned key",
+            Self::GenerationRegressed => "bundle generation is older than the applied generation",
+        };
+        f.write_str(msg)
+    }
+}
+
 impl Error {
     /// Build a [`Error::ConfigInvalid`] from a static or owned reason.
     ///
@@ -273,6 +354,10 @@ mod tests {
             Error::HeartbeatTransport,
             Error::HeartbeatRejected,
             Error::InvalidHeartbeatResponse,
+            Error::CaBundleTransport,
+            Error::CaBundleRejected,
+            Error::InvalidCaBundle(CaBundleError::FingerprintMismatch),
+            Error::CaReloadFailed,
             Error::Unsupported,
         ];
         for err in errors {
@@ -320,6 +405,15 @@ mod tests {
             TrustedCaError::DisallowedAlgorithm.to_string(),
             "key algorithm is not allowed"
         );
+    }
+
+    #[test]
+    fn ca_bundle_error_messages_are_stable() {
+        assert_eq!(
+            CaBundleError::FingerprintMismatch.to_string(),
+            "bundle fingerprint does not match its contents"
+        );
+        assert_eq!(CaBundleError::Empty.to_string(), "bundle contains no keys");
     }
 
     #[test]

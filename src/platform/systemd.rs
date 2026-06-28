@@ -45,6 +45,18 @@ pub fn restart_sshd() -> Result<()> {
     Err(Error::Unsupported)
 }
 
+/// Verify that `sshd` is active and accepted its (re)loaded configuration.
+///
+/// # Errors
+///
+/// Always returns [`Error::Unsupported`] in this build: querying the service
+/// manager is not yet enabled. The wrapper exists to fix the architecture; it
+/// performs no action.
+pub fn verify_sshd_active() -> Result<()> {
+    tracing::debug!("verify_sshd_active called but is not enabled in this build");
+    Err(Error::Unsupported)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -64,5 +76,13 @@ mod tests {
     #[test]
     fn restart_sshd_is_unsupported() {
         assert!(matches!(restart_sshd().unwrap_err(), Error::Unsupported));
+    }
+
+    #[test]
+    fn verify_sshd_active_is_unsupported() {
+        assert!(matches!(
+            verify_sshd_active().unwrap_err(),
+            Error::Unsupported
+        ));
     }
 }
