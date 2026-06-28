@@ -30,7 +30,10 @@
 //! * [`state`] — the shared application state;
 //! * [`platform`] — architecture-only wrappers for Linux/systemd operations;
 //! * [`ssh`] — parsing/validation models for the trusted-CA file and the sshd
-//!   drop-in (read-only; no writes).
+//!   drop-in (read-only; no writes);
+//! * [`identity`] — the Ed25519 machine identity and the enrollment flow
+//!   (machine keypair, strongly typed DTOs, validation, and a mockable API
+//!   client abstraction; **no HTTP implementation and no request signing yet**).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,8 +41,10 @@
 pub mod clock;
 pub mod config;
 pub mod errors;
+pub mod identity;
 pub mod logging;
 pub mod platform;
+pub mod protocol;
 pub mod security;
 pub mod service;
 pub mod ssh;

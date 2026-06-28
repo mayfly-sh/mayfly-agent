@@ -72,12 +72,122 @@ pub enum Error {
     #[error("invalid TrustedUserCAKeys entry: {0}")]
     InvalidTrustedCa(TrustedCaError),
 
+    /// The machine is already enrolled; re-enrollment is refused.
+    #[error("machine is already enrolled")]
+    AlreadyEnrolled,
+
+    /// A machine identity key already exists and must not be overwritten.
+    #[error("machine identity key already exists")]
+    KeyAlreadyExists,
+
+    /// Generating a new machine identity key failed.
+    #[error("failed to generate machine identity key")]
+    KeyGeneration,
+
+    /// Parsing a stored machine identity key failed.
+    #[error("failed to parse machine identity key")]
+    KeyParse,
+
+    /// Serialising a machine identity key failed.
+    #[error("failed to serialise machine identity key")]
+    KeySerialize,
+
+    /// A hostname failed validation.
+    #[error("invalid hostname")]
+    InvalidHostname,
+
+    /// An enrollment token failed validation.
+    ///
+    /// The token value itself is never included, in keeping with the no-secret
+    /// logging policy.
+    #[error("invalid enrollment token")]
+    InvalidToken,
+
+    /// A server URL failed validation.
+    #[error("invalid server URL")]
+    InvalidServerUrl,
+
+    /// A public key was not a well-formed, allowed key.
+    #[error("malformed public key")]
+    MalformedPublicKey,
+
+    /// A server response failed validation. The reason is a fixed enum, so no
+    /// server-controlled data reaches the message.
+    #[error("untrusted server response: {0}")]
+    InvalidServerResponse(ServerResponseError),
+
+    /// The server rejected the enrollment request (e.g. invalid token).
+    #[error("enrollment was rejected by the server")]
+    EnrollmentRejected,
+
+    /// Communication with the server failed.
+    #[error("failed to communicate with the enrollment server")]
+    EnrollmentTransport,
+
+    /// Building or signing an authenticated request failed.
+    #[error("failed to sign request")]
+    RequestSigning,
+
+    /// Communication with the server for an authenticated request failed.
+    #[error("failed to communicate with the server")]
+    HeartbeatTransport,
+
+    /// The server rejected an authenticated request (e.g. bad signature).
+    #[error("server rejected the request")]
+    HeartbeatRejected,
+
+    /// The server returned a heartbeat response that failed validation.
+    #[error("untrusted heartbeat response")]
+    InvalidHeartbeatResponse,
+
+    /// The persisted machine record could not be parsed.
+    #[error("failed to parse machine record")]
+    MachineRecordParse(#[source] serde_json::Error),
+
+    /// The persisted machine record could not be serialised.
+    #[error("failed to serialise machine record")]
+    MachineRecordSerialize(#[source] serde_json::Error),
+
+    /// The persisted machine record parsed but held a semantically invalid
+    /// value (e.g. an out-of-range timestamp).
+    #[error("machine record is invalid")]
+    MachineRecordInvalid,
+
     /// The requested operation is intentionally not enabled in this build.
     ///
     /// Used by the architecture-only platform wrappers (e.g. reloading sshd)
     /// that exist but deliberately perform no action yet.
     #[error("operation is not supported in this build")]
     Unsupported,
+}
+
+/// Fixed, non-sensitive reasons a server enrollment response can be rejected.
+///
+/// A closed enum guarantees no server-controlled string is ever interpolated
+/// into an error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServerResponseError {
+    /// The `machine_id` was empty.
+    EmptyMachineId,
+    /// The `machine_id` contained disallowed characters or was too long.
+    InvalidMachineId,
+    /// An interval was zero or outside the accepted range.
+    IntervalOutOfRange,
+    /// The `server_identity` was not a valid Ed25519 public key.
+    InvalidServerIdentity,
+}
+
+impl fmt::Display for ServerResponseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            Self::EmptyMachineId => "machine_id is empty",
+            Self::InvalidMachineId => "machine_id is invalid",
+            Self::IntervalOutOfRange => "interval is out of range",
+            Self::InvalidServerIdentity => "server_identity is not a valid key",
+        };
+        f.write_str(msg)
+    }
 }
 
 /// Fixed, non-sensitive reasons a TrustedUserCAKeys entry can be rejected.
@@ -147,6 +257,22 @@ mod tests {
             Error::InvalidPath,
             Error::NotRoot,
             Error::InvalidTrustedCa(TrustedCaError::DisallowedAlgorithm),
+            Error::AlreadyEnrolled,
+            Error::KeyAlreadyExists,
+            Error::KeyGeneration,
+            Error::KeyParse,
+            Error::KeySerialize,
+            Error::InvalidHostname,
+            Error::InvalidToken,
+            Error::InvalidServerUrl,
+            Error::MalformedPublicKey,
+            Error::InvalidServerResponse(ServerResponseError::InvalidMachineId),
+            Error::EnrollmentRejected,
+            Error::EnrollmentTransport,
+            Error::RequestSigning,
+            Error::HeartbeatTransport,
+            Error::HeartbeatRejected,
+            Error::InvalidHeartbeatResponse,
             Error::Unsupported,
         ];
         for err in errors {
@@ -160,6 +286,25 @@ mod tests {
                 "error message leaked sensitive context: {shown:?}"
             );
         }
+    }
+
+    #[test]
+    fn token_value_never_appears_in_error_display() {
+        // The token error is intentionally value-free.
+        let err = Error::InvalidToken;
+        assert_eq!(err.to_string(), "invalid enrollment token");
+    }
+
+    #[test]
+    fn server_response_error_messages_are_stable() {
+        assert_eq!(
+            ServerResponseError::EmptyMachineId.to_string(),
+            "machine_id is empty"
+        );
+        assert_eq!(
+            ServerResponseError::InvalidServerIdentity.to_string(),
+            "server_identity is not a valid key"
+        );
     }
 
     #[test]

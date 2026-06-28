@@ -22,6 +22,7 @@ path = "src/main.rs"
 #   * Must build for x86_64, aarch64, armv7 and armv6 Linux targets.
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 thiserror = "1.0"
 tracing = "0.1"
@@ -36,6 +37,29 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 time = { version = "0.3", features = ["macros"] }
 rustix = { version = "1", features = ["process"] }
 tempfile = "3"
+# Pure-Rust (RustCrypto) Ed25519 + OpenSSH key handling. No OpenSSL, no ssh-keygen.
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std"] }
+rand = "0.8"
+zeroize = "1"
+# Request-signing protocol: raw Ed25519 signing, SHA-256 body digests, and
+# Base64 headers. All pure Rust (RustCrypto); ed25519-dalek shares ssh-key's
+# major version so no second curve implementation is pulled in.
+ed25519-dalek = "2"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+# Blocking HTTPS client. rustls with the `ring` provider only — no OpenSSL,
+# no native-tls, no aws-lc — mirroring the server's proven configuration.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "blocking",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "logging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
