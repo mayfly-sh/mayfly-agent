@@ -194,6 +194,8 @@ pub enum ServerResponseError {
     IntervalOutOfRange,
     /// The `server_identity` was not a valid Ed25519 public key.
     InvalidServerIdentity,
+    /// The `bundle_signing_key`, when present, was not a valid Ed25519 key.
+    InvalidBundleSigningKey,
 }
 
 impl fmt::Display for ServerResponseError {
@@ -203,6 +205,7 @@ impl fmt::Display for ServerResponseError {
             Self::InvalidMachineId => "machine_id is invalid",
             Self::IntervalOutOfRange => "interval is out of range",
             Self::InvalidServerIdentity => "server_identity is not a valid key",
+            Self::InvalidBundleSigningKey => "bundle_signing_key is not a valid key",
         };
         f.write_str(msg)
     }

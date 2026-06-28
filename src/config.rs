@@ -35,6 +35,7 @@ const MAX_MACHINE_ID_LEN: usize = 128;
 const DEFAULT_TRUSTED_CA_PATH: &str = "/etc/ssh/mayfly/trusted_user_ca_keys";
 const DEFAULT_SSHD_CONFIG_PATH: &str = "/etc/ssh/sshd_config.d/mayfly.conf";
 const DEFAULT_STATE_DIR: &str = "/var/lib/mayfly";
+const DEFAULT_IDENTITY_DIR: &str = "/etc/mayfly-agent";
 
 /// File name (under `state_dir`) holding the last-applied bundle generation.
 pub const GENERATION_FILE: &str = "current_generation";
@@ -149,6 +150,14 @@ pub struct Config {
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
 
+    /// Absolute path to the directory holding the machine identity: the Ed25519
+    /// private/public key and the persisted machine record. Conventionally the
+    /// agent's config directory (`/etc/mayfly-agent`); kept separate from
+    /// [`state_dir`](Config::state_dir) so long-lived secrets live under `/etc`
+    /// while mutable runtime state lives under `/var/lib`.
+    #[serde(default = "default_identity_dir")]
+    pub identity_dir: PathBuf,
+
     /// Operator-provisioned bundle-signing public key (OpenSSH Ed25519 line).
     ///
     /// When set, this is the trust anchor for bundle signatures: a bundle whose
@@ -195,6 +204,10 @@ fn default_sshd_config_path() -> PathBuf {
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from(DEFAULT_STATE_DIR)
+}
+
+fn default_identity_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_IDENTITY_DIR)
 }
 
 fn default_poll_jitter_ratio() -> f64 {
@@ -261,6 +274,9 @@ impl Config {
         if let Some(v) = get_env(&key("STATE_DIR")) {
             self.state_dir = PathBuf::from(v);
         }
+        if let Some(v) = get_env(&key("IDENTITY_DIR")) {
+            self.identity_dir = PathBuf::from(v);
+        }
         if let Some(v) = get_env(&key("BUNDLE_SIGNING_PUBLIC_KEY")) {
             let trimmed = v.trim();
             self.bundle_signing_public_key = if trimmed.is_empty() {
@@ -299,6 +315,7 @@ impl Config {
         validate_managed_path("trusted_ca_path", &self.trusted_ca_path)?;
         validate_managed_path("sshd_config_path", &self.sshd_config_path)?;
         validate_managed_path("state_dir", &self.state_dir)?;
+        validate_managed_path("identity_dir", &self.identity_dir)?;
         validate_jitter_ratio(self.poll_jitter_ratio)?;
         validate_optional_signing_key(self.bundle_signing_public_key.as_deref())?;
 
@@ -517,6 +534,7 @@ mod tests {
             PathBuf::from(DEFAULT_SSHD_CONFIG_PATH)
         );
         assert_eq!(cfg.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
+        assert_eq!(cfg.identity_dir, PathBuf::from(DEFAULT_IDENTITY_DIR));
         assert_eq!(
             cfg.generation_path(),
             PathBuf::from("/var/lib/mayfly/current_generation")

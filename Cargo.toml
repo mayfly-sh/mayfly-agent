@@ -35,8 +35,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "registry",
 ] }
 time = { version = "0.3", features = ["macros", "formatting", "parsing"] }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "system"] }
 tempfile = "3"
+# Async-signal-safe SIGINT/SIGTERM handling for graceful shutdown. Pure-Rust
+# (FFI bindings only); no C TLS stack. The registered handler only sets an
+# AtomicBool, which the runtime polls between sleep slices.
+signal-hook = { version = "0.3", default-features = false }
 # Pure-Rust (RustCrypto) Ed25519 + OpenSSH key handling. No OpenSSL, no ssh-keygen.
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std"] }
 rand = "0.8"

@@ -96,6 +96,12 @@ pub struct EnrollmentResponse {
     pub sync_interval: u64,
     /// The server's identity key, used in a later phase to verify the server.
     pub server_identity: String,
+    /// The server's Bundle Signing Key (OpenSSH Ed25519). When present, the
+    /// agent **pins** this at enrollment and verifies every CA bundle against
+    /// it. Optional because a server without a configured bundle signer omits
+    /// it, in which case the agent falls back to trust-on-first-use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_signing_key: Option<String>,
 }
 
 /// Validate an enrollment token's structure.
@@ -188,6 +194,11 @@ pub fn validate_response(response: &EnrollmentResponse) -> Result<()> {
     }
     validate_ed25519_public_key(&response.server_identity)
         .map_err(|_| Error::InvalidServerResponse(ServerResponseError::InvalidServerIdentity))?;
+    if let Some(key) = response.bundle_signing_key.as_deref() {
+        validate_ed25519_public_key(key).map_err(|_| {
+            Error::InvalidServerResponse(ServerResponseError::InvalidBundleSigningKey)
+        })?;
+    }
     Ok(())
 }
 
@@ -553,6 +564,7 @@ mod tests {
             heartbeat_interval: 60,
             sync_interval: 300,
             server_identity: valid_server_identity(),
+            bundle_signing_key: None,
         }
     }
 
@@ -656,6 +668,20 @@ mod tests {
             validate_response(&r).unwrap_err(),
             Error::InvalidServerResponse(ServerResponseError::InvalidServerIdentity)
         ));
+
+        let mut r = ok_response();
+        r.bundle_signing_key = Some("not-a-key".to_string());
+        assert!(matches!(
+            validate_response(&r).unwrap_err(),
+            Error::InvalidServerResponse(ServerResponseError::InvalidBundleSigningKey)
+        ));
+    }
+
+    #[test]
+    fn response_validation_accepts_valid_bundle_signing_key() {
+        let mut r = ok_response();
+        r.bundle_signing_key = Some(valid_server_identity());
+        validate_response(&r).unwrap();
     }
 
     // ---- DTO serialization ----

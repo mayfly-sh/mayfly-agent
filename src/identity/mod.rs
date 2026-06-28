@@ -20,10 +20,15 @@
 //! [`MayflyApiClient`]: enrollment::MayflyApiClient
 //! [`EnrollmentService`]: enrollment::EnrollmentService
 
+pub mod api_client;
 pub mod enrollment;
 pub mod keypair;
 pub mod machine;
 
+pub use api_client::{
+    EnrollmentHttp, HttpEnrollmentClient, ReqwestEnrollmentHttp, DEFAULT_ENROLL_TIMEOUT,
+    ENROLL_PATH,
+};
 pub use enrollment::{
     EnrollmentRequest, EnrollmentResponse, EnrollmentService, MayflyApiClient, MockMayflyApiClient,
 };

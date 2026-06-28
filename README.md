@@ -7,11 +7,14 @@ associated `sshd` configuration safely. It runs as root under systemd.
 This is **not** a general-purpose remote-management agent. It does not execute
 arbitrary commands, open shells, or expose a control plane.
 
-> **Status — foundation only.** This repository currently contains just the
-> internal architecture. The following are intentionally **not** implemented
-> yet: networking, enrollment, heartbeats, CA synchronisation, any modification
-> of `sshd_config`, and restarting/reloading `sshd`. There are no installation
-> scripts.
+> **Status — working runtime (milestone 006).** The agent runs as a daemon that
+> enrolls over HTTPS, heartbeats, and synchronises the signed CA bundle on a
+> jittered schedule, with graceful `SIGINT`/`SIGTERM` shutdown and persistent
+> runtime state. **One deliberate gap remains:** applying a new bundle requires
+> reloading `sshd`, and the reload/verify path is still `Error::Unsupported`
+> (a privileged helper / systemd unit + install scripts land in a later
+> milestone). Until then a bundle *apply* rolls back by design; enrollment,
+> heartbeats, and bundle fetch/verify/persist all work.
 
 ## What is implemented
 
@@ -23,9 +26,11 @@ arbitrary commands, open shells, or expose a control plane.
 | `errors`      | A single `Error` type whose user-facing messages never contain filesystem paths. |
 | `logging`     | Structured `tracing` in JSON or pretty format. |
 | `state`       | `AppState` bundling `Config`, the `Clock`, and startup time. |
-| `platform`    | Architecture-only Linux/systemd wrappers (`validate_root`, `is_systemd`, `reload_sshd`, `restart_sshd`). |
-| `ssh`         | Read-only parsing/validation of the `TrustedUserCAKeys` file and the sshd `TrustedUserCAKeys` directive. |
-| `service`     | The `Agent` orchestrator skeleton (owns `AppState`). |
+| `identity`    | Ed25519 machine identity, enrollment service, and the production HTTP enrollment client (`api_client`). |
+| `protocol`    | Request signing, the heartbeat client, and the CA-bundle verify/apply/rollback sync service. |
+| `platform`    | Linux/systemd wrappers: `validate_root`, `is_systemd`, host facts (`uname`/IP); `reload_sshd`/`verify_sshd_active` still return `Error::Unsupported`. |
+| `ssh`         | Parsing/validation of the `TrustedUserCAKeys` file and the sshd `TrustedUserCAKeys` directive. |
+| `service`     | The `Daemon` (startup, enrollment/recovery, poll loop), `Scheduler`, `backoff`, `shutdown`, and persistent `runtime_state`. |
 
 ## Security properties
 
@@ -42,9 +47,17 @@ arbitrary commands, open shells, or expose a control plane.
   place.
 - Errors never leak filesystem paths to callers; path context is logged via
   structured `tracing` instead.
-- The privileged service-control wrappers (`reload_sshd`, `restart_sshd`) are
-  architecture-only and deliberately perform **no action** (they return
-  `Error::Unsupported`) until wired up in a reviewed, later phase.
+- The privileged service-control wrappers (`reload_sshd`, `restart_sshd`,
+  `verify_sshd_active`) deliberately perform **no action** (they return
+  `Error::Unsupported`) until wired up in a reviewed, later phase; a new CA
+  bundle therefore rolls back rather than being half-applied.
+- Enrollment uses a single-use token supplied **only** via the
+  `MAYFLY_AGENT_ENROLLMENT_TOKEN` environment variable; it is never written to
+  disk. The server-provided bundle signing key is pinned trust-on-first-use.
+- TLS is rustls + ring; certificate validation is only ever disabled behind the
+  dev-only `allow_insecure_tls` flag, which is logged loudly at startup.
+- Synchronous, thread-based runtime (no async executor); shutdown is prompt
+  because sleeps are interruptible and check the signal flag in small steps.
 
 ## Configuration
 
@@ -57,9 +70,13 @@ itself can be set via `MAYFLY_AGENT_CONFIG`.
 | `server_url`         | string          | —       | required; must be `https://` unless `allow_insecure_tls` |
 | `machine_id`         | string          | —       | required; `[A-Za-z0-9._-]`, ≤128 chars |
 | `heartbeat_interval` | integer seconds | `60`    | 1..=86400 |
-| `sync_interval`      | integer seconds | `300`   | 1..=86400 |
-| `trusted_ca_path`    | path            | `/etc/ssh/mayfly_ca.pub` | must be absolute, no `..` |
+| `sync_interval`      | integer seconds | `300`   | 1..=86400 (interval comes from enrollment at runtime) |
+| `trusted_ca_path`    | path            | `/etc/ssh/mayfly/trusted_user_ca_keys` | must be absolute, no `..` |
 | `sshd_config_path`   | path            | `/etc/ssh/sshd_config.d/mayfly.conf` | must be absolute, no `..` |
+| `state_dir`          | path            | `/var/lib/mayfly` | runtime state (generation, fingerprint, `runtime_status.json`) |
+| `identity_dir`       | path            | `/etc/mayfly-agent` | machine keypair + `machine.json` |
+| `bundle_signing_public_key` | string   | — (TOFU) | operator pin; if unset the enrollment key is pinned on first use |
+| `poll_jitter_ratio`  | float           | `0.10`  | jitter applied to heartbeat/sync cadence |
 | `log_level`          | enum            | `info`  | `trace`/`debug`/`info`/`warn`/`error` |
 | `log_format`         | enum            | `json`  | `json`/`pretty` |
 | `allow_insecure_tls` | bool            | `false` | development only |
@@ -81,7 +98,7 @@ log_format = "json"
 
 ```text
 src/
-├── main.rs            # binary entry point (foundation wiring only)
+├── main.rs            # binary entry point → Daemon::run
 ├── lib.rs             # crate root and module graph
 ├── config.rs          # configuration + env overrides + validation
 ├── state.rs           # AppState (Config + Clock + startup time)
@@ -89,14 +106,42 @@ src/
 ├── logging.rs         # tracing setup (JSON + pretty)
 ├── clock.rs           # injectable Clock abstraction
 ├── security.rs        # hardened filesystem primitives
+├── identity/
+│   ├── keypair.rs     # Ed25519 MachineKeypair
+│   ├── machine.rs     # MachineIdentity / MachineRecord persistence
+│   ├── enrollment.rs  # EnrollmentService + MayflyApiClient trait
+│   └── api_client.rs  # production HTTP enrollment client (reqwest + rustls)
+├── protocol/
+│   ├── signing.rs     # request signing (byte-compatible with the server)
+│   ├── heartbeat.rs   # HeartbeatClient + ReqwestTransport
+│   ├── ca_bundle.rs   # bundle model + canonicalisation + verification
+│   └── ca_sync.rs     # CaSyncService: fetch → verify → apply → reload → ack
 ├── platform/
-│   ├── linux.rs       # validate_root, effective_uid
-│   └── systemd.rs     # is_systemd, reload_sshd, restart_sshd (architecture only)
+│   ├── linux.rs       # validate_root, effective_uid, host_facts
+│   └── systemd.rs     # is_systemd; reload_sshd/verify_sshd_active (Error::Unsupported)
 ├── ssh/
 │   ├── trusted_ca.rs  # TrustedUserCAKeys parsing/validation
 │   └── sshd_config.rs # TrustedUserCAKeys directive inspect/render (read-only)
 └── service/
-    └── agent.rs       # Agent orchestrator skeleton
+    ├── daemon.rs        # startup, enrollment/recovery, the poll loop
+    ├── scheduler.rs     # dual-cadence jittered scheduler
+    ├── backoff.rs       # cancellable exponential backoff (enrollment)
+    ├── shutdown.rs      # signal handlers + interruptible sleeper
+    ├── runtime_state.rs # RuntimeStatus + recovery + signing-key pin
+    └── agent.rs         # legacy AppState holder (superseded by Daemon)
+```
+
+## Running
+
+```bash
+# First boot (not yet enrolled): supply the single-use token via the environment.
+MAYFLY_AGENT_ENROLLMENT_TOKEN=mf_enroll_... \
+  mayfly-agent   # reads /etc/mayfly-agent/config.toml; enrolls, then heartbeats + syncs
+
+# Subsequent boots recover the persisted identity and need no token.
+mayfly-agent
+
+# Stop cleanly with SIGINT/SIGTERM (Ctrl-C); a clean-shutdown status is persisted.
 ```
 
 ## Building and testing
