@@ -2,9 +2,9 @@
 //!
 //! This module performs **no I/O**: it only renders the canonical drop-in text
 //! and parses provided configuration text. Writing the drop-in, validating with
-//! `sshd -t`, and reloading are performed by the privileged helper
-//! ([`crate::helper::ops`]); this module supplies the byte-exact content and the
-//! detection logic it relies on.
+//! `sshd -t`, and reloading are performed by the privileged `mayfly-helper` (a
+//! separate repository); the agent uses this module for startup SSH-compatibility
+//! checks (`Include` detection) and to render content it sends over IPC.
 //!
 //! Operations:
 //!

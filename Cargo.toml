@@ -17,11 +17,9 @@ path = "src/lib.rs"
 name = "mayfly-agent"
 path = "src/main.rs"
 
-# The privileged helper (runs as root). Shares the audited library modules
-# (security, ssh, errors, logging) with the agent. See ADR-0008.
-[[bin]]
-name = "mayfly-helper"
-path = "src/bin/mayfly-helper.rs"
+# Note: the privileged `mayfly-helper` was extracted into its own repository in
+# milestone 008 (ADR-0009). This crate now ships only the unprivileged agent and
+# the IPC client (src/ipc) used to talk to it.
 
 # Hard dependency rules for this security product:
 #   * Pure Rust only. No OpenSSL, no native-tls, no C TLS stack.

@@ -1,11 +1,16 @@
 //! The agent↔helper socket protocol: message types, framing, and token auth.
 //!
-//! This module is shared by both ends of the Unix Domain Socket, so it contains
-//! no I/O policy beyond framing. Messages are length-prefixed (a `u32`
-//! big-endian byte count followed by that many bytes of compact JSON), and the
-//! body is capped at [`MAX_BODY_BYTES`] *before* allocation to bound a hostile
-//! or buggy peer. Every request carries a [`PROTOCOL_VERSION`] and a capability
-//! token; the helper compares the token in constant time ([`constant_time_eq`]).
+//! This is the agent's **consumer copy** of the Mayfly IPC protocol. The
+//! canonical definition is owned by `mayfly-helper` (a separate repository) and
+//! specified in `contracts/helper-socket.json`; this file is kept byte-identical
+//! pending a shared crate (ADR-0009, BL-017).
+//!
+//! The module contains no I/O policy beyond framing. Messages are
+//! length-prefixed (a `u32` big-endian byte count followed by that many bytes of
+//! compact JSON), and the body is capped at [`MAX_BODY_BYTES`] *before*
+//! allocation to bound a hostile or buggy peer. Every request carries a
+//! [`PROTOCOL_VERSION`] and a capability token; the helper compares the token in
+//! constant time ([`constant_time_eq`]).
 
 use std::io::{Read, Write};
 
@@ -26,7 +31,7 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// An explicit, allow-listed privileged operation.
 ///
 /// There is deliberately no generic filesystem or "run command" variant: every
-/// operation maps to one reviewed action in [`super::ops`].
+/// operation maps to one reviewed action implemented by the `mayfly-helper`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {

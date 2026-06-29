@@ -7,19 +7,23 @@
 //! This is deliberately **not** a general-purpose remote-management agent. It
 //! does not execute arbitrary commands, open shells, or expose a control plane.
 //!
-//! ## Privilege separation (two binaries)
+//! ## Privilege separation (three repositories)
 //!
-//! The crate produces two binaries that cooperate over an authenticated Unix
-//! domain socket:
+//! Mayfly is split into three single-responsibility repositories that cooperate:
 //!
-//! * **`mayfly-agent`** (`src/main.rs`) — runs **unprivileged**. Enrollment,
-//!   heartbeat, CA synchronisation, scheduling, networking, persistence, and
-//!   startup validation.
-//! * **`mayfly-helper`** (`src/bin/mayfly-helper.rs`) — runs as **root** and
-//!   performs only the small, explicit set of privileged operations (atomically
-//!   replace `TrustedUserCAKeys`, create required directories, install/update the
-//!   `sshd` drop-in, validate `sshd -t`, reload, verify the service). It never
-//!   executes arbitrary commands and exposes no generic filesystem API.
+//! * **`mayfly-server`** — the control plane (enrollment, certificates, bundle
+//!   signing, CA lifecycle, audit), reached over HTTPS.
+//! * **`mayfly-agent`** (this crate) — runs **unprivileged**. Enrollment,
+//!   heartbeat, CA synchronisation, scheduling, networking, persistence, startup
+//!   validation, and the **IPC client** to the helper.
+//! * **`mayfly-helper`** (a separate repository) — runs as **root** and performs
+//!   only the small, explicit set of privileged host operations (atomically
+//!   replace `TrustedUserCAKeys`, create directories, install/update the `sshd`
+//!   drop-in, validate `sshd -t`, reload, verify the service). The agent reaches
+//!   it over an authenticated Unix domain socket.
+//!
+//! This crate therefore contains **no privileged implementation** — only the
+//! [`ipc`] client and protocol it uses to delegate to `mayfly-helper`.
 //!
 //! ## Modules
 //!
@@ -41,8 +45,8 @@
 //!   verify/apply orchestration;
 //! * [`service`] — the daemon orchestrator, jittered scheduler, and startup
 //!   validation;
-//! * [`helper`] — the privileged helper: authenticated UDS server, the agent-side
-//!   client, the explicit privileged-operation set, and the `sshd` control seam.
+//! * [`ipc`] — the agent-side client and protocol for delegating privileged host
+//!   operations to the root `mayfly-helper` over an authenticated Unix socket.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -50,8 +54,8 @@
 pub mod clock;
 pub mod config;
 pub mod errors;
-pub mod helper;
 pub mod identity;
+pub mod ipc;
 pub mod logging;
 pub mod platform;
 pub mod protocol;

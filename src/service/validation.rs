@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::errors::{Error, Result};
-use crate::helper::client::HelperClient;
+use crate::ipc::HelperClient;
 use crate::platform::systemd;
 use crate::ssh::sshd_config;
 

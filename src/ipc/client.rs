@@ -4,6 +4,9 @@
 //! request, and reads one response. The capability token is loaded from a
 //! root-owned, group-readable file; it is never logged. Transport and
 //! authentication failures map to the crate's path-free [`Error`] variants.
+//!
+//! The server this talks to lives in the `mayfly-helper` repository; this module
+//! is the agent's only knowledge of the privileged boundary.
 
 use std::io::Read as _;
 use std::os::unix::net::UnixStream;
@@ -11,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::errors::{Error, Result};
-use crate::helper::protocol::{self, Operation, Outcome, Request, Response};
+use crate::ipc::protocol::{self, Operation, Outcome, Request, Response};
 
 /// Per-call connect/read/write timeout.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -136,17 +139,23 @@ fn check_ok(resp: &Response) -> Result<Outcome> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use super::*;
-    use crate::helper::ops::{HelperOps, OpsConfig};
-    use crate::helper::server::HelperServer;
-    use crate::helper::sshd_control::{SshdControlConfig, SystemSshdControl};
+    use crate::ipc::protocol::PROTOCOL_VERSION;
 
-    /// Spawn a helper server on a temp socket; return (client, stop, join).
-    fn spawn_server(
-        token: &str,
+    /// The version string our mock helper reports for `Ping`.
+    const MOCK_VERSION: &str = "mock-helper-0.0.0";
+
+    /// A minimal in-test stand-in for the real `mayfly-helper` server (which now
+    /// lives in a separate repository). It speaks the framing protocol, checks
+    /// the protocol version + token, and answers `Ping`; it performs no
+    /// privileged operations. This keeps the client's transport/auth-mapping
+    /// covered without depending on helper code.
+    fn spawn_mock_server(
+        expected_token: &str,
     ) -> (
         tempfile::TempDir,
         PathBuf,
@@ -155,43 +164,68 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("helper.sock");
-        let token = token.to_string();
-        let ops_config = OpsConfig {
-            trusted_ca_path: dir.path().join("etc/ssh/mayfly/trusted_user_ca_keys"),
-            dropin_path: dir.path().join("etc/ssh/sshd_config.d/90-mayfly.conf"),
-            main_sshd_config: dir.path().join("etc/ssh/sshd_config"),
-        };
-        // Ping does not touch sshd; SystemSshdControl with missing binaries is
-        // sufficient for the transport/auth tests here.
-        let sshd = SystemSshdControl::new(SshdControlConfig::default());
-        let ops = HelperOps::new(ops_config, sshd);
-        let server = HelperServer::new(socket.clone(), token, ops);
+        let client_socket = socket.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
 
+        let expected = expected_token.to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let socket_thread = socket.clone();
         let handle = std::thread::spawn(move || {
-            server.run(&stop_thread).unwrap();
-            let _ = socket_thread;
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let response = match protocol::read_frame(&mut stream) {
+                            Ok(body) => match protocol::decode_request(&body) {
+                                Ok(req) if req.protocol_version != PROTOCOL_VERSION => {
+                                    Response::failure(
+                                        Outcome::Unhealthy,
+                                        "unsupported protocol version",
+                                    )
+                                }
+                                Ok(req)
+                                    if !protocol::constant_time_eq(
+                                        req.token.as_bytes(),
+                                        expected.as_bytes(),
+                                    ) =>
+                                {
+                                    Response::failure(Outcome::Unhealthy, "unauthenticated")
+                                }
+                                Ok(req) if req.op == Operation::Ping => Response {
+                                    ok: true,
+                                    outcome: Outcome::Ok,
+                                    helper_version: Some(MOCK_VERSION.to_string()),
+                                    detail: None,
+                                },
+                                Ok(_) => Response::success(Outcome::Ok),
+                                Err(_) => Response::failure(Outcome::Unhealthy, "protocol error"),
+                            },
+                            Err(_) => Response::failure(Outcome::Unhealthy, "protocol error"),
+                        };
+                        if let Ok(body) = protocol::encode_response(&response) {
+                            let _ = protocol::write_frame(&mut stream, &body);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let _ = std::fs::remove_file(&socket);
         });
 
-        // Wait for the socket to appear so the client does not race the bind.
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        (dir, socket, stop, handle)
+        // Socket already exists (bound above), so no race for the client.
+        (dir, client_socket, stop, handle)
     }
 
     #[test]
     fn ping_round_trip_returns_version() {
-        let (_dir, socket, stop, handle) = spawn_server("secret-token");
+        let (_dir, socket, stop, handle) = spawn_mock_server("secret-token");
         let client = HelperClient::new(socket, "secret-token".to_string());
 
         let version = client.ping().unwrap();
-        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(version, MOCK_VERSION);
 
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -199,7 +233,7 @@ mod tests {
 
     #[test]
     fn wrong_token_is_rejected_as_unauthenticated() {
-        let (_dir, socket, stop, handle) = spawn_server("real-token");
+        let (_dir, socket, stop, handle) = spawn_mock_server("real-token");
         let client = HelperClient::new(socket, "wrong-token".to_string());
 
         let err = client.ping().unwrap_err();
