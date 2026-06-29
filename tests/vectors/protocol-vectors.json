@@ -1,0 +1,47 @@
+{
+  "_comment": "Canonical cross-repository golden protocol vectors (BL-026, milestone 009D). The PERMANENT reference for every Mayfly protocol implementation. Generated ONCE from mayfly-agent's canonical functions; consumed independently and byte-identically by mayfly-server and mayfly-agent (each recomputes from its own code and asserts equality). Do NOT hand-edit. Regenerate only via the documented procedure in outputs/analysis/protocol/golden-vectors.md. Any divergence MUST fail CI.",
+  "schema_version": 1,
+  "signing_domain": "mayfly-agent-auth-v1",
+  "bundle": {
+    "bundle_version": 1,
+    "generation": 42,
+    "created_at": "2026-01-01T00:00:00Z",
+    "expires_at": "2026-02-01T00:00:00Z",
+    "signature_algorithm": "ssh-ed25519",
+    "keys": [
+      {
+        "key_id": "ca-01",
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c ca-01"
+      },
+      {
+        "key_id": "ca-02",
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOU ca-02"
+      }
+    ],
+    "fingerprint_payload": "{\"generation\":42,\"keys\":[{\"key_id\":\"ca-01\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c ca-01\"},{\"key_id\":\"ca-02\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOU ca-02\"}]}",
+    "fingerprint": "sha256:1b932dea3b97e300d8477414f3eefcf51a7e935044aa719476e8a6c0c6099b24",
+    "etag": "\"sha256:1b932dea3b97e300d8477414f3eefcf51a7e935044aa719476e8a6c0c6099b24\"",
+    "signing_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs bundle-signing",
+    "signing_payload": "{\"bundle_version\":1,\"created_at\":\"2026-01-01T00:00:00Z\",\"expires_at\":\"2026-02-01T00:00:00Z\",\"fingerprint\":\"sha256:1b932dea3b97e300d8477414f3eefcf51a7e935044aa719476e8a6c0c6099b24\",\"generation\":42,\"keys\":[{\"key_id\":\"ca-01\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c ca-01\"},{\"key_id\":\"ca-02\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOU ca-02\"}]}",
+    "signature": "FnSXGrgthUUxQj7hNPbT+oRSA1iDj/AYBYA/m8za9COEetFnvhq4UdPwUePvRwuT4wFQ1zAl6yBDwQ7adk3pAA==",
+    "signed_response_json": "{\"bundle_signing_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs bundle-signing\",\"bundle_version\":1,\"created_at\":\"2026-01-01T00:00:00Z\",\"expires_at\":\"2026-02-01T00:00:00Z\",\"fingerprint\":\"sha256:1b932dea3b97e300d8477414f3eefcf51a7e935044aa719476e8a6c0c6099b24\",\"generation\":42,\"keys\":[{\"key_id\":\"ca-01\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIqI4910CfGV/VLbLTy6XXLKZwm/HZQSG/N0iAG0D29c ca-01\"},{\"key_id\":\"ca-02\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOU ca-02\"}],\"signature\":\"FnSXGrgthUUxQj7hNPbT+oRSA1iDj/AYBYA/m8za9COEetFnvhq4UdPwUePvRwuT4wFQ1zAl6yBDwQ7adk3pAA==\",\"signature_algorithm\":\"ssh-ed25519\"}"
+  },
+  "request_signing": {
+    "machine_id": "srv-golden",
+    "timestamp": 1700000000,
+    "nonce": "00112233445566778899aabbccddeeff",
+    "method": "POST",
+    "path": "/api/v1/agent/heartbeat",
+    "body": "{\"agent_version\":\"0.1.0\"}",
+    "body_sha256": "cea5c058f1eeab327f68a42c4c6e63350dfc9d5b9e08d5332697e7f6b172b126",
+    "canonical_string": "mayfly-agent-auth-v1\nsrv-golden\n1700000000\n00112233445566778899aabbccddeeff\nPOST\n/api/v1/agent/heartbeat\ncea5c058f1eeab327f68a42c4c6e63350dfc9d5b9e08d5332697e7f6b172b126",
+    "machine_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY machine",
+    "signature": "odohTjMkAzZemguP8JPOi54LhRWPJHXIVYr7Q6SJvXF5p0t4t/J6qjEfRjckdprOyUR07D8eWhCnLAhygvBhCQ==",
+    "minimal_canonical_string": "mayfly-agent-auth-v1\nm\n5\nn\nPOST\n/p\ndeadbeef"
+  },
+  "helper_ipc": {
+    "max_body_bytes": 1048576,
+    "request_json": "{\"protocol_version\":1,\"token\":\"golden-test-token\",\"op\":\"ping\"}",
+    "framed_hex": "0000003e7b2270726f746f636f6c5f76657273696f6e223a312c22746f6b656e223a22676f6c64656e2d746573742d746f6b656e222c226f70223a2270696e67227d"
+  }
+}

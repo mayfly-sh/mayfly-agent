@@ -37,8 +37,8 @@
 //! * [`logging`] — structured `tracing` (JSON and pretty);
 //! * [`state`] — the shared application state;
 //! * [`platform`] — Linux host facts + root validation;
-//! * [`ssh`] — trusted-CA parsing/validation + `sshd` drop-in rendering and
-//!   `Include`-directive detection;
+//! * [`ssh`] — read-only trusted-CA body parsing/validation and `sshd_config`
+//!   `Include`-directive detection (drop-in rendering/writing is the helper's job);
 //! * [`identity`] — the Ed25519 machine identity and enrollment flow (keypair,
 //!   DTOs, validation, and the production HTTP enrollment client);
 //! * [`protocol`] — request signing, heartbeat, and signed CA-bundle
@@ -63,6 +63,9 @@ pub mod security;
 pub mod service;
 pub mod ssh;
 pub mod state;
+
+#[cfg(test)]
+mod golden_vectors;
 
 pub use errors::{Error, Result};
 pub use state::AppState;
