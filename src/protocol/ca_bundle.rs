@@ -27,7 +27,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -321,6 +321,13 @@ impl CaBundle {
 
 /// Verify a detached Ed25519 signature over `payload` using an OpenSSH Ed25519
 /// public key.
+///
+/// Uses [`VerifyingKey::verify_strict`], matching the server byte-for-byte
+/// (`mayfly-server/src/bundle/signer.rs` and `agentauth/signing.rs`). Strict
+/// verification rejects signatures made with small-order / non-canonical public
+/// keys, closing Ed25519 malleability gaps; the whole platform therefore shares
+/// identical verification semantics (BL-025). All error mappings collapse to
+/// [`CaBundleError::SignatureInvalid`] as before.
 fn verify_signature(
     payload: &[u8],
     signature_b64: &str,
@@ -344,7 +351,7 @@ fn verify_signature(
     let signature = Signature::from_bytes(&sig_array);
 
     verifying_key
-        .verify(payload, &signature)
+        .verify_strict(payload, &signature)
         .map_err(|_| CaBundleError::SignatureInvalid)
 }
 
@@ -879,5 +886,83 @@ mod tests {
         let base = signer.public_openssh.clone();
         let with_comment = format!("{} a-different-comment", base.trim());
         assert!(public_keys_equal(&base, &with_comment));
+    }
+
+    /// Build an OpenSSH `ssh-ed25519` line from raw 32-byte public-key material.
+    fn openssh_from_raw(raw: [u8; 32]) -> String {
+        let ssh = ssh_key::public::Ed25519PublicKey(raw);
+        ssh_key::PublicKey::new(ssh_key::public::KeyData::Ed25519(ssh), "test")
+            .to_openssh()
+            .unwrap()
+    }
+
+    /// BL-025 parity: `verify_signature` must accept exactly the signatures the
+    /// server produces — a well-formed Ed25519 signature over the payload.
+    #[test]
+    fn verify_signature_accepts_valid_ed25519_signature() {
+        let signer = Signer25519::new();
+        let payload = b"mayfly-bundle-canonical-payload";
+        let sig = signer.sign(payload);
+        assert!(verify_signature(payload, &sig, &signer.public_openssh).is_ok());
+    }
+
+    /// A signature over a different payload must fail (no malleability).
+    #[test]
+    fn verify_signature_rejects_payload_mismatch() {
+        let signer = Signer25519::new();
+        let sig = signer.sign(b"original-payload");
+        assert_eq!(
+            verify_signature(b"tampered-payload", &sig, &signer.public_openssh).unwrap_err(),
+            CaBundleError::SignatureInvalid
+        );
+    }
+
+    /// BL-025 regression: this is the behaviour that distinguishes
+    /// `verify_strict` (server semantics) from plain `verify`. The Edwards
+    /// identity element is a small-order public key; `VerifyingKey::from_bytes`
+    /// accepts it, and the all-zero signature (R = identity, s = 0) satisfies the
+    /// *cofactorless* equation that plain `verify` uses — so plain `verify` would
+    /// ACCEPT this forgery. `verify_strict` rejects it on the small-order key,
+    /// exactly as the server does. If this ever reverts to `.verify()`, the
+    /// assertion below fails.
+    #[test]
+    fn verify_strict_rejects_small_order_signing_key_forgery() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1; // canonical encoding of the order-1 Edwards point
+        let openssh = openssh_from_raw(identity);
+        let forged_sig = BASE64.encode([0u8; 64]); // R = identity, s = 0
+        assert_eq!(
+            verify_signature(b"any-payload", &forged_sig, &openssh).unwrap_err(),
+            CaBundleError::SignatureInvalid
+        );
+    }
+
+    /// The same small-order-key rejection must hold through the full
+    /// `CaBundle::from_response` path, mapping to `SignatureInvalid`.
+    #[test]
+    fn from_response_rejects_small_order_signer() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let openssh = openssh_from_raw(identity);
+        let keys = vec![key("ca-01", &pubkey())];
+        let generation = 1;
+        let fingerprint = compute_fingerprint(generation, &keys);
+        let created_at = (now() - time::Duration::hours(1)).format(&Rfc3339).unwrap();
+        let expires_at = (now() + time::Duration::hours(1)).format(&Rfc3339).unwrap();
+        let raw = CaBundleResponse {
+            bundle_version: Some(SUPPORTED_BUNDLE_VERSION),
+            generation: Some(generation),
+            fingerprint: Some(fingerprint),
+            created_at: Some(created_at),
+            expires_at: Some(expires_at),
+            keys,
+            signature_algorithm: Some(SIGNATURE_ALGORITHM.to_string()),
+            signature: Some(BASE64.encode([0u8; 64])),
+            bundle_signing_public_key: Some(openssh),
+        };
+        assert_eq!(
+            CaBundle::from_response(raw, now(), None).unwrap_err(),
+            CaBundleError::SignatureInvalid
+        );
     }
 }
