@@ -38,9 +38,6 @@ pub const MODE_PUBLIC: u32 = 0o644;
 /// Permission bits for managed directories (owner only).
 pub const MODE_DIR: u32 = 0o700;
 
-/// The owner uid expected for root-managed files.
-pub const ROOT_UID: u32 = 0;
-
 /// Permission mask for "writable by group or other".
 const GROUP_OR_OTHER_WRITABLE: u32 = 0o022;
 
@@ -90,16 +87,6 @@ pub fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
     let parent = parent_of(dst)?;
     std::fs::rename(src, dst).map_err(|e| io(dst, e))?;
     fsync_dir(parent)
-}
-
-/// `fsync` the file at `path`, flushing its data and metadata to stable storage.
-///
-/// # Errors
-///
-/// Returns [`Error::Io`] if the file cannot be opened or synced.
-pub fn fsync(path: &Path) -> Result<()> {
-    let file = std::fs::File::open(path).map_err(|e| io(path, e))?;
-    file.sync_all().map_err(|e| io(path, e))
 }
 
 /// `fsync` a directory so a contained create/rename becomes durable.
@@ -161,15 +148,6 @@ pub fn validate_owner(path: &Path, expected_uid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Validate that `path` is owned by root (uid 0).
-///
-/// # Errors
-///
-/// See [`validate_owner`].
-pub fn ensure_owned_by_root(path: &Path) -> Result<()> {
-    validate_owner(path, ROOT_UID)
-}
-
 /// Validate that `path` is not writable by group or other.
 ///
 /// # Errors
@@ -212,20 +190,6 @@ pub fn validate_mode_at_most(path: &Path, allowed_mode: u32) -> Result<()> {
         );
         return Err(Error::InsecurePermissions);
     }
-    Ok(())
-}
-
-/// Composite validation for a root-managed file that the daemon intends to
-/// trust: it must not be a symlink, must be owned by root, and must not exceed
-/// `allowed_mode` permission bits.
-///
-/// # Errors
-///
-/// Returns the first failing check's error (see the individual helpers).
-pub fn validate_trusted_file(path: &Path, allowed_mode: u32) -> Result<()> {
-    ensure_not_symlink(path)?;
-    ensure_owned_by_root(path)?;
-    validate_mode_at_most(path, allowed_mode)?;
     Ok(())
 }
 
@@ -303,11 +267,10 @@ mod tests {
     }
 
     #[test]
-    fn fsync_and_fsync_dir_succeed() {
+    fn fsync_dir_succeeds() {
         let dir = tempdir();
         let path = dir.path().join("file");
         std::fs::write(&path, b"data").unwrap();
-        fsync(&path).unwrap();
         fsync_dir(dir.path()).unwrap();
     }
 
@@ -399,37 +362,6 @@ mod tests {
         assert!(matches!(
             validate_mode_at_most(&path, 0o644).unwrap_err(),
             Error::InsecurePermissions
-        ));
-    }
-
-    #[test]
-    fn validate_trusted_file_combines_checks() {
-        let dir = tempdir();
-        let path = dir.path().join("file");
-        std::fs::write(&path, b"x").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        // Owned by the current (test) user, not root, so ownership check fails
-        // unless we happen to run as root.
-        let result = validate_trusted_file(&path, 0o644);
-        let uid = std::fs::symlink_metadata(&path).unwrap().uid();
-        if uid == ROOT_UID {
-            assert!(result.is_ok());
-        } else {
-            assert!(matches!(result.unwrap_err(), Error::InsecureOwnership));
-        }
-    }
-
-    #[test]
-    fn validate_trusted_file_rejects_symlink_first() {
-        let dir = tempdir();
-        let target = dir.path().join("target");
-        let link = dir.path().join("link");
-        std::fs::write(&target, b"x").unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(matches!(
-            validate_trusted_file(&link, 0o644).unwrap_err(),
-            Error::UnexpectedSymlink
         ));
     }
 }

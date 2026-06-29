@@ -153,9 +153,9 @@ pub enum Error {
     #[error("untrusted CA bundle: {0}")]
     InvalidCaBundle(CaBundleError),
 
-    /// Reloading `sshd` after writing a new bundle failed; the previous bundle
-    /// was restored. The path is logged, never included here.
-    #[error("failed to reload sshd; previous CA bundle was restored")]
+    /// The privileged helper could not apply a new bundle and restored the
+    /// previous one (fail-closed); the agent does not advance its generation.
+    #[error("helper could not apply the bundle; previous CA bundle was restored")]
     CaReloadFailed,
 
     /// The persisted machine record could not be parsed.
@@ -170,13 +170,6 @@ pub enum Error {
     /// value (e.g. an out-of-range timestamp).
     #[error("machine record is invalid")]
     MachineRecordInvalid,
-
-    /// The requested operation is intentionally not enabled in this build.
-    ///
-    /// Used by the architecture-only platform wrappers (e.g. reloading sshd)
-    /// that exist but deliberately perform no action yet.
-    #[error("operation is not supported in this build")]
-    Unsupported,
 
     /// The privileged helper could not be reached over its socket.
     #[error("privileged helper is unavailable")]
@@ -196,15 +189,6 @@ pub enum Error {
     /// non-sensitive string carried separately in logs/responses, never a path.
     #[error("helper operation failed")]
     HelperOperationFailed,
-
-    /// `sshd -t` rejected the candidate configuration. The offending detail is
-    /// logged, never included here.
-    #[error("sshd configuration validation failed")]
-    SshdValidationFailed,
-
-    /// `sshd` was not active after a reload, or the service query failed.
-    #[error("sshd is not active")]
-    SshdInactive,
 }
 
 /// Fixed, non-sensitive reasons a server enrollment response can be rejected.
@@ -389,7 +373,6 @@ mod tests {
             Error::CaBundleRejected,
             Error::InvalidCaBundle(CaBundleError::FingerprintMismatch),
             Error::CaReloadFailed,
-            Error::Unsupported,
         ];
         for err in errors {
             let shown = err.to_string();

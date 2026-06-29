@@ -1,20 +1,21 @@
 # mayfly-agent
 
 A minimal, **security-first** Linux daemon whose only responsibility is to
-synchronise OpenSSH `TrustedUserCAKeys` from the Mayfly server and maintain the
-associated `sshd` configuration safely. It runs as root under systemd.
+synchronise OpenSSH `TrustedUserCAKeys` from the Mayfly server. It runs
+**unprivileged** under systemd and delegates every privileged host operation to
+the root `mayfly-helper`.
 
 This is **not** a general-purpose remote-management agent. It does not execute
 arbitrary commands, open shells, or expose a control plane.
 
-> **Status — working runtime (milestone 006).** The agent runs as a daemon that
-> enrolls over HTTPS, heartbeats, and synchronises the signed CA bundle on a
-> jittered schedule, with graceful `SIGINT`/`SIGTERM` shutdown and persistent
-> runtime state. **One deliberate gap remains:** applying a new bundle requires
-> reloading `sshd`, and the reload/verify path is still `Error::Unsupported`
-> (a privileged helper / systemd unit + install scripts land in a later
-> milestone). Until then a bundle *apply* rolls back by design; enrollment,
-> heartbeats, and bundle fetch/verify/persist all work.
+> **Status — working runtime (milestone 009 / BL-015).** The agent runs as a
+> daemon that enrolls over HTTPS, heartbeats, and synchronises the signed CA
+> bundle on a jittered schedule, with graceful `SIGINT`/`SIGTERM` shutdown and
+> persistent runtime state. The privileged apply (atomic write of
+> `TrustedUserCAKeys`, `sshd -t`, reload, verify, rollback) is owned entirely by
+> the `mayfly-helper` and reached over an authenticated Unix Domain Socket via
+> the `BundleApplier` port (ADR-0012). The agent itself performs **no** privileged
+> filesystem writes to host paths and never reloads `sshd`.
 
 ## What is implemented
 
@@ -22,7 +23,7 @@ arbitrary commands, open shells, or expose a control plane.
 |---------------|----------------|
 | `config`      | Strongly typed config with `MAYFLY_AGENT_*` environment overrides and validation. |
 | `clock`       | Injectable clock abstraction (`SystemClock` + deterministic `FixedClock`/`MockClock`). |
-| `security`    | Reusable hardened FS primitives: `secure_write`, `atomic_replace`, `fsync`, and permission/owner/symlink validation. |
+| `security`    | Reusable hardened FS primitives for the agent's **own** files: `secure_write`, `atomic_replace`, `fsync_dir`, and permission/owner/symlink validation. |
 | `errors`      | A single `Error` type whose user-facing messages never contain filesystem paths. |
 | `logging`     | Structured `tracing` in JSON or pretty format. |
 | `state`       | `AppState` bundling `Config`, the `Clock`, and startup time. |
@@ -30,7 +31,7 @@ arbitrary commands, open shells, or expose a control plane.
 | `protocol`    | Request signing, the heartbeat client, and the CA-bundle verify/render sync service, which delegates the privileged apply through the `BundleApplier` port. |
 | `ipc`         | The `mayfly-helper` client (`HelperClient`) and `HelperBundleApplier`, the production applier that routes the live apply through the helper over the UDS. |
 | `platform`    | Read-only Linux/systemd inspections: `validate_root`, `is_systemd`, host facts (`uname`/IP). No privileged service-control; that is owned by the helper. |
-| `ssh`         | Parsing/validation of the `TrustedUserCAKeys` file and the sshd `TrustedUserCAKeys` directive. |
+| `ssh`         | Read-only `TrustedUserCAKeys` body validation (defence in depth before delegating) and a startup `sshd_config` `Include` check. |
 | `service`     | The `Daemon` (startup, enrollment/recovery, poll loop), `Scheduler`, `backoff`, `shutdown`, and persistent `runtime_state`. |
 
 ## Security properties
@@ -128,7 +129,7 @@ src/
 │   └── systemd.rs     # is_systemd (read-only); no privileged service-control here
 ├── ssh/
 │   ├── trusted_ca.rs  # TrustedUserCAKeys parsing/validation
-│   └── sshd_config.rs # TrustedUserCAKeys directive inspect/render (read-only)
+│   └── sshd_config.rs # sshd_config Include detection (read-only)
 └── service/
     ├── daemon.rs        # startup, enrollment/recovery, the poll loop
     ├── scheduler.rs     # dual-cadence jittered scheduler

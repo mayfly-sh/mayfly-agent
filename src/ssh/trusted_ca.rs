@@ -91,14 +91,6 @@ impl CaPublicKey {
             comment,
         })
     }
-
-    /// Render this key as a canonical single line (no trailing newline).
-    pub fn render(&self) -> String {
-        match &self.comment {
-            Some(comment) => format!("{} {} {}", self.algorithm, self.key_data, comment),
-            None => format!("{} {}", self.algorithm, self.key_data),
-        }
-    }
 }
 
 /// The validated contents of a `TrustedUserCAKeys` file.
@@ -142,20 +134,6 @@ impl TrustedCaKeys {
     /// Whether there are no keys.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
-    }
-
-    /// Render all keys to canonical file contents, one per line, with a trailing
-    /// newline (empty string if there are no keys).
-    pub fn render(&self) -> String {
-        if self.keys.is_empty() {
-            return String::new();
-        }
-        let mut out = String::new();
-        for key in &self.keys {
-            out.push_str(&key.render());
-            out.push('\n');
-        }
-        out
     }
 }
 
@@ -296,7 +274,6 @@ mod tests {
         let keys = TrustedCaKeys::parse("\n\n# only comments\n").unwrap();
         assert!(keys.is_empty());
         assert_eq!(keys.len(), 0);
-        assert_eq!(keys.render(), "");
     }
 
     #[test]
@@ -306,21 +283,5 @@ mod tests {
             TrustedCaKeys::parse(&contents).unwrap_err(),
             Error::InvalidTrustedCa(TrustedCaError::DisallowedAlgorithm)
         ));
-    }
-
-    #[test]
-    fn render_round_trips_through_parse() {
-        let contents = format!("ssh-ed25519 {b} primary\nssh-rsa {b}\n", b = blob());
-        let keys = TrustedCaKeys::parse(&contents).unwrap();
-        let rendered = keys.render();
-        let reparsed = TrustedCaKeys::parse(&rendered).unwrap();
-        assert_eq!(keys, reparsed);
-    }
-
-    #[test]
-    fn single_key_render_round_trips() {
-        let line = format!("ssh-ed25519 {} some comment", blob());
-        let key = CaPublicKey::parse(&line).unwrap();
-        assert_eq!(CaPublicKey::parse(&key.render()).unwrap(), key);
     }
 }

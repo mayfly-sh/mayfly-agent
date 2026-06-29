@@ -31,8 +31,8 @@
 //!   including the helper socket/token paths;
 //! * [`clock`] — an injectable clock abstraction (no `SystemTime::now()` in
 //!   business logic);
-//! * [`security`] — reusable, hardened filesystem primitives (atomic replace,
-//!   `fsync`, permission/owner/symlink validation);
+//! * [`security`] — reusable, hardened filesystem primitives (atomic, `fsync`-durable
+//!   replace, permission/owner/symlink validation) for the agent's own files;
 //! * [`errors`] — a single error type that never leaks filesystem paths;
 //! * [`logging`] — structured `tracing` (JSON and pretty);
 //! * [`state`] — the shared application state;
