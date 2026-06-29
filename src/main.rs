@@ -29,6 +29,12 @@ fn config_path() -> std::path::PathBuf {
 }
 
 fn run(config: Config) -> Result<()> {
+    // Startup validation: log every check, then abort on any fatal finding with
+    // an actionable, path-free diagnostic before doing any work.
+    let report = mayfly_agent::service::validate_startup(&config);
+    report.log();
+    report.into_result()?;
+
     let clock = std::sync::Arc::new(SystemClock::new());
     let state = AppState::new(config, clock);
     Daemon::new(state).run()

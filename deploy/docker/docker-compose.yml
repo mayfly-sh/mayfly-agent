@@ -1,0 +1,51 @@
+# Docker-first integration topology for milestone 007.
+#
+#   server  — mayfly-server (issues bundles, accepts heartbeats/acks)
+#   host    — managed target: sshd + mayfly-helper (root) + mayfly-agent (user)
+#
+# The agent↔helper link is a LOCAL unix socket, so agent + helper + sshd share
+# the `host` container (a faithful model of a real deployment target). The
+# end-to-end assertions (TrustedUserCAKeys update, sshd -t, reload, SSH cert
+# login, rollback) are driven from the CI host by `run-integration.sh`, which
+# uses `docker compose exec`.
+#
+# Build contexts differ: `host` builds from the mayfly-agent crate; `server`
+# builds from the repository root. Bring the topology up via run-integration.sh.
+#
+# Execution of this suite (SSH cert login + rollback) is performed on a Linux/CI
+# host in increment 007b; see deploy/README.md.
+
+services:
+  server:
+    build:
+      context: ../../..
+      dockerfile: mayfly-agent/deploy/docker/Dockerfile.server
+    environment:
+      # Finalised in 007b (TLS, GitHub OAuth/test-mode, admin authz, DB path).
+      MAYFLY_SERVER_TEST_MODE: "1"
+    networks: [mayfly]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  host:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.host
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      MAYFLY_SERVER_URL: "https://server:8443"
+      MAYFLY_MACHINE_ID: "docker-host"
+      MAYFLY_ALLOW_INSECURE_TLS: "true"
+    # sshd manages kernel-level session bits; the test host runs privileged so
+    # the helper's reload path behaves as on a real host. (Production uses the
+    # hardened systemd units, NOT privileged.)
+    privileged: true
+    networks: [mayfly]
+
+networks:
+  mayfly: {}

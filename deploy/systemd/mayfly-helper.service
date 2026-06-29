@@ -1,0 +1,57 @@
+[Unit]
+Description=Mayfly privileged helper (manages OpenSSH TrustedUserCAKeys)
+Documentation=https://github.com/mayfly/mayfly-agent
+# The helper must be up before the agent so the agent can apply on first sync.
+Before=mayfly-agent.service
+After=network.target
+
+[Service]
+Type=simple
+# Runs as root (the only component that does), but with Group=mayfly + a setgid
+# runtime directory so the socket it creates is group-owned by mayfly and the
+# unprivileged agent can connect at mode 0660.
+User=root
+Group=mayfly
+ExecStart=/usr/local/sbin/mayfly-helper
+Restart=on-failure
+RestartSec=2
+
+# /run/mayfly is created root:mayfly with the setgid bit, so the socket the
+# helper binds inherits the mayfly group.
+RuntimeDirectory=mayfly
+RuntimeDirectoryMode=2750
+
+Environment=MAYFLY_HELPER_SOCKET_PATH=/run/mayfly/helper.sock
+Environment=MAYFLY_HELPER_TOKEN_PATH=/etc/mayfly-agent/helper.token
+
+# --- Hardening -------------------------------------------------------------
+# The helper legitimately needs to write the SSH trust files and talk to the
+# service manager, so ProtectSystem is "full" (/usr,/boot,/etc read-only) with
+# explicit ReadWritePaths for the SSH config it manages.
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/etc/ssh /etc/ssh/sshd_config.d
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Only Unix sockets are needed for the local control socket.
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+# Curated allow-list. We deliberately do NOT add ~@privileged here: the helper
+# is root and must drive the service manager (systemctl reload/is-active);
+# over-filtering would break the reload path. @resources is denied as the helper
+# never tunes them.
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources
+
+[Install]
+WantedBy=multi-user.target

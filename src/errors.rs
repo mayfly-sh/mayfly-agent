@@ -177,6 +177,34 @@ pub enum Error {
     /// that exist but deliberately perform no action yet.
     #[error("operation is not supported in this build")]
     Unsupported,
+
+    /// The privileged helper could not be reached over its socket.
+    #[error("privileged helper is unavailable")]
+    HelperUnavailable,
+
+    /// A helper request or response violated the socket protocol (bad framing,
+    /// oversized body, unsupported protocol version, or malformed JSON).
+    #[error("helper protocol error")]
+    HelperProtocol,
+
+    /// The helper rejected a request as unauthenticated (missing or wrong
+    /// capability token). The token value is never included.
+    #[error("helper rejected the request: unauthenticated")]
+    HelperUnauthenticated,
+
+    /// A helper operation ran but reported failure. The reason is a fixed,
+    /// non-sensitive string carried separately in logs/responses, never a path.
+    #[error("helper operation failed")]
+    HelperOperationFailed,
+
+    /// `sshd -t` rejected the candidate configuration. The offending detail is
+    /// logged, never included here.
+    #[error("sshd configuration validation failed")]
+    SshdValidationFailed,
+
+    /// `sshd` was not active after a reload, or the service query failed.
+    #[error("sshd is not active")]
+    SshdInactive,
 }
 
 /// Fixed, non-sensitive reasons a server enrollment response can be rejected.

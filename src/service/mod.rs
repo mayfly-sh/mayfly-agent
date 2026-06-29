@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod runtime_state;
 pub mod scheduler;
 pub mod shutdown;
+pub mod validation;
 
 pub use agent::Agent;
 pub use backoff::{retry_with_backoff, BackoffPolicy};
@@ -21,6 +22,7 @@ pub use scheduler::{
     Sleeper, ThreadSleeper,
 };
 pub use shutdown::{install_signal_handlers, InterruptibleSleeper, Shutdown};
+pub use validation::{validate_startup, Check, Severity, ValidationReport};
 
 /// Drive a future to completion on the current thread without pulling in an
 /// async runtime.

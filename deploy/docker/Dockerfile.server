@@ -1,0 +1,24 @@
+# mayfly-server image for integration testing.
+#
+# Build context: the repository root (so the mayfly-server crate is available).
+#   docker build -f mayfly-agent/deploy/docker/Dockerfile.server -t mayfly-server .
+#
+# NOTE: server runtime configuration (TLS cert/key, GitHub OAuth, admin authz,
+# DB path) is supplied at run time via a mounted config + env. The e2e bootstrap
+# (seeding an enrollment token and registering a CA) is finalised in increment
+# 007b, which wires the server's test-mode token seeding so the flow runs without
+# interactive GitHub OAuth.
+
+FROM rust:1.74-bookworm AS builder
+WORKDIR /src
+COPY mayfly-server /src/mayfly-server
+WORKDIR /src/mayfly-server
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/mayfly-server/target/release/mayfly-server /usr/local/bin/mayfly-server
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/mayfly-server"]

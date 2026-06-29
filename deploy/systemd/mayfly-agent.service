@@ -1,0 +1,53 @@
+[Unit]
+Description=Mayfly agent (enrollment, heartbeat, CA bundle synchronisation)
+Documentation=https://github.com/mayfly/mayfly-agent
+Wants=network-online.target mayfly-helper.service
+After=network-online.target mayfly-helper.service
+
+[Service]
+Type=simple
+# Fully unprivileged. The agent holds NO root capability; every privileged
+# action is delegated to mayfly-helper over the authenticated socket.
+User=mayfly
+Group=mayfly
+ExecStart=/usr/local/bin/mayfly-agent
+Restart=on-failure
+RestartSec=5
+# A heartbeat-driven daemon; if it wedges, systemd restarts it.
+WatchdogSec=0
+
+Environment=MAYFLY_AGENT_CONFIG=/etc/mayfly-agent/config.toml
+
+# State lives under /var/lib/mayfly (created/owned by the unit's user).
+StateDirectory=mayfly
+StateDirectoryMode=0750
+
+# --- Hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+# The agent writes only its state dir; everything else is read-only.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mayfly
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Network (HTTPS to the server) over IPv4/IPv6 + the local helper socket.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

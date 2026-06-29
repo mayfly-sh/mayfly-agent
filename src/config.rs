@@ -36,6 +36,8 @@ const DEFAULT_TRUSTED_CA_PATH: &str = "/etc/ssh/mayfly/trusted_user_ca_keys";
 const DEFAULT_SSHD_CONFIG_PATH: &str = "/etc/ssh/sshd_config.d/mayfly.conf";
 const DEFAULT_STATE_DIR: &str = "/var/lib/mayfly";
 const DEFAULT_IDENTITY_DIR: &str = "/etc/mayfly-agent";
+const DEFAULT_HELPER_SOCKET_PATH: &str = "/run/mayfly/helper.sock";
+const DEFAULT_HELPER_TOKEN_PATH: &str = "/etc/mayfly-agent/helper.token";
 
 /// File name (under `state_dir`) holding the last-applied bundle generation.
 pub const GENERATION_FILE: &str = "current_generation";
@@ -158,6 +160,18 @@ pub struct Config {
     #[serde(default = "default_identity_dir")]
     pub identity_dir: PathBuf,
 
+    /// Absolute path to the privileged helper's Unix Domain Socket. The agent
+    /// connects here to perform the root-only operations (apply
+    /// `TrustedUserCAKeys`, manage the sshd drop-in, reload `sshd`). See ADR-0008.
+    #[serde(default = "default_helper_socket_path")]
+    pub helper_socket_path: PathBuf,
+
+    /// Absolute path to the helper capability-token file. The token authenticates
+    /// the agent to the helper; the file is owned `root:mayfly` mode `0640` and is
+    /// never logged.
+    #[serde(default = "default_helper_token_path")]
+    pub helper_token_path: PathBuf,
+
     /// Operator-provisioned bundle-signing public key (OpenSSH Ed25519 line).
     ///
     /// When set, this is the trust anchor for bundle signatures: a bundle whose
@@ -208,6 +222,14 @@ fn default_state_dir() -> PathBuf {
 
 fn default_identity_dir() -> PathBuf {
     PathBuf::from(DEFAULT_IDENTITY_DIR)
+}
+
+fn default_helper_socket_path() -> PathBuf {
+    PathBuf::from(DEFAULT_HELPER_SOCKET_PATH)
+}
+
+fn default_helper_token_path() -> PathBuf {
+    PathBuf::from(DEFAULT_HELPER_TOKEN_PATH)
 }
 
 fn default_poll_jitter_ratio() -> f64 {
@@ -277,6 +299,12 @@ impl Config {
         if let Some(v) = get_env(&key("IDENTITY_DIR")) {
             self.identity_dir = PathBuf::from(v);
         }
+        if let Some(v) = get_env(&key("HELPER_SOCKET_PATH")) {
+            self.helper_socket_path = PathBuf::from(v);
+        }
+        if let Some(v) = get_env(&key("HELPER_TOKEN_PATH")) {
+            self.helper_token_path = PathBuf::from(v);
+        }
         if let Some(v) = get_env(&key("BUNDLE_SIGNING_PUBLIC_KEY")) {
             let trimmed = v.trim();
             self.bundle_signing_public_key = if trimmed.is_empty() {
@@ -316,6 +344,8 @@ impl Config {
         validate_managed_path("sshd_config_path", &self.sshd_config_path)?;
         validate_managed_path("state_dir", &self.state_dir)?;
         validate_managed_path("identity_dir", &self.identity_dir)?;
+        validate_managed_path("helper_socket_path", &self.helper_socket_path)?;
+        validate_managed_path("helper_token_path", &self.helper_token_path)?;
         validate_jitter_ratio(self.poll_jitter_ratio)?;
         validate_optional_signing_key(self.bundle_signing_public_key.as_deref())?;
 
@@ -535,6 +565,14 @@ mod tests {
         );
         assert_eq!(cfg.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
         assert_eq!(cfg.identity_dir, PathBuf::from(DEFAULT_IDENTITY_DIR));
+        assert_eq!(
+            cfg.helper_socket_path,
+            PathBuf::from(DEFAULT_HELPER_SOCKET_PATH)
+        );
+        assert_eq!(
+            cfg.helper_token_path,
+            PathBuf::from(DEFAULT_HELPER_TOKEN_PATH)
+        );
         assert_eq!(
             cfg.generation_path(),
             PathBuf::from("/var/lib/mayfly/current_generation")
