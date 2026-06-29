@@ -15,17 +15,20 @@
 //!       → generation regressed vs. persisted? fail (downgrade protection)
 //!       → identical to persisted? record last_success, done (Unchanged)
 //!       → render TrustedUserCAKeys → re-parse to validate
-//!         → secure_write temp + fsync + atomic rename + dir fsync
-//!           → reload sshd → verify reload
-//!             → failure: restore previous file, reload, verify; ack failure; fail
+//!         → delegate the privileged apply to the helper ([`BundleApplier`]):
+//!             atomic write + `sshd -t` + reload + verify + rollback
+//!           → helper rolled back? ack failure; fail (generation NOT advanced)
 //!           → persist generation, fingerprint, pin, last_success
 //!             → ack success
 //! ```
 //!
-//! Everything that touches the outside world — HTTP and the `sshd`
-//! reload/verify — is injected behind a trait, so the whole flow is
-//! deterministic under test with a mock transport, a mock clock, a temp-dir
-//! filesystem, and a mock reloader. There are **no sleeps** here; cadence and
+//! The agent itself performs **no** privileged filesystem writes to the managed
+//! `TrustedUserCAKeys` and never reloads `sshd`: those steps belong to the root
+//! `mayfly-helper`, reached through the [`BundleApplier`] port (ADR-0008/0012).
+//! Everything that touches the outside world — HTTP and the privileged apply —
+//! is injected behind a trait, so the whole flow is deterministic under test
+//! with a mock transport, a mock clock, a temp-dir filesystem (for the agent's
+//! own state), and a mock applier. There are **no sleeps** here; cadence and
 //! jitter live in [`crate::service::scheduler`].
 //!
 //! ## Trust model (hostile network assumed)
@@ -109,42 +112,38 @@ impl CaBundleTransport for ReqwestTransport {
     }
 }
 
-/// Abstraction over reloading `sshd` and verifying it accepted the new config.
+/// Abstraction over applying a rendered `TrustedUserCAKeys` body to the host.
 ///
-/// Injected so synchronisation can be tested without a real service manager,
-/// and so this security-sensitive capability is added in exactly one place.
-pub trait SshdReloader: Send + Sync {
-    /// Reload `sshd`'s configuration.
+/// This is the agent's **port** to the privileged boundary. The implementor owns
+/// every privileged step — atomic write, `sshd -t`, reload, verify, and rollback
+/// — so the (unprivileged) agent performs no privileged filesystem writes or
+/// `sshd` control itself. In production the adapter is
+/// [`crate::ipc::HelperBundleApplier`], which delegates to the root
+/// `mayfly-helper` over an authenticated Unix Domain Socket (ADR-0008/0012);
+/// tests inject a mock.
+pub trait BundleApplier: Send + Sync {
+    /// Apply a fully-rendered `TrustedUserCAKeys` body, owning the privileged
+    /// write + `sshd -t` + reload + verify + rollback.
     ///
     /// # Errors
     ///
-    /// Returns an error if the reload could not be performed.
-    fn reload(&self) -> Result<()>;
-
-    /// Verify `sshd` is active and accepted the (re)loaded configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `sshd` is not healthy after the reload.
-    fn verify(&self) -> Result<()>;
+    /// Returns an error only if the apply could not be *attempted* (for example
+    /// the privileged helper is unreachable or rejects the caller); in that case
+    /// the host is left unchanged. A privileged-side failure that was safely
+    /// rolled back is reported as [`BundleApplyOutcome::RolledBack`], not `Err`.
+    fn apply(&self, trusted_ca_keys: &str) -> Result<BundleApplyOutcome>;
 }
 
-/// Production reloader delegating to the platform's systemd wrappers.
-///
-/// Note: in this build the underlying `platform::systemd` operations are
-/// architecture-only and return [`Error::Unsupported`]; wiring them to the
-/// service manager is a deliberate, separately-reviewed step.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemdSshdReloader;
-
-impl SshdReloader for SystemdSshdReloader {
-    fn reload(&self) -> Result<()> {
-        crate::platform::systemd::reload_sshd()
-    }
-
-    fn verify(&self) -> Result<()> {
-        crate::platform::systemd::verify_sshd_active()
-    }
+/// The result of delegating an apply to a [`BundleApplier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleApplyOutcome {
+    /// The new `TrustedUserCAKeys` was applied (written, `sshd -t`, reloaded and
+    /// verified) or was already current — the host now trusts the new bundle.
+    Applied,
+    /// The privileged side could not apply the new bundle and restored the
+    /// previous one (fail-closed). The host still trusts the previous bundle, so
+    /// the agent must not advance its generation.
+    RolledBack,
 }
 
 /// Status values the agent reports in an [`AckReport`].
@@ -154,6 +153,13 @@ impl SshdReloader for SystemdSshdReloader {
 /// rollback is audited without advancing it.
 const ACK_STATUS_APPLIED: &str = "applied";
 const ACK_STATUS_ROLLBACK: &str = "rollback";
+
+/// Fixed, non-sensitive reason reported when the helper rolled an apply back.
+///
+/// The privileged helper guarantees rollback-safety (it restores the previous
+/// `TrustedUserCAKeys`, or removes it if none existed), so the agent reports a
+/// single, stable reason. It is never a path or secret.
+const ACK_ROLLBACK_REASON: &str = "sshd apply failed; previous bundle restored";
 
 /// The acknowledgement reported to the server after a sync pass.
 ///
@@ -200,15 +206,12 @@ pub enum SyncOutcome {
     },
 }
 
-/// The outcome of the file-replacement + reload phase.
+/// The outcome of delegating the privileged apply to the [`BundleApplier`].
 enum ApplyResult {
-    /// File replaced, `sshd` reloaded and verified.
+    /// The helper applied the new bundle and `sshd` is healthy.
     Applied,
-    /// Reload or verify failed after the write; the previous file was restored.
-    ReloadFailed {
-        /// Whether the previous bundle was successfully restored.
-        rolled_back: bool,
-    },
+    /// The helper could not apply and restored the previous bundle (fail-closed).
+    RolledBack,
 }
 
 /// Persisted local state read at the start of a pass.
@@ -219,16 +222,20 @@ struct PersistedState {
     signing_key: Option<String>,
 }
 
-/// Synchronises the local `TrustedUserCAKeys` with the server's signed bundle.
-pub struct CaSyncService<T: CaBundleTransport, R: SshdReloader> {
+/// Synchronises the host's `TrustedUserCAKeys` with the server's signed bundle.
+///
+/// The managed `TrustedUserCAKeys` path is **not** held here: the agent renders
+/// the file body and hands it to the [`BundleApplier`], which owns the path and
+/// every privileged operation. The paths this struct does hold are the agent's
+/// own, unprivileged state files under the state directory.
+pub struct CaSyncService<T: CaBundleTransport, A: BundleApplier> {
     transport: T,
-    reloader: R,
+    applier: A,
     clock: Arc<dyn Clock>,
     keypair: MachineKeypair,
     machine_id: String,
     server_url: String,
     pinned_signing_key: Option<String>,
-    trusted_ca_path: PathBuf,
     generation_path: PathBuf,
     fingerprint_path: PathBuf,
     signing_key_path: PathBuf,
@@ -236,22 +243,22 @@ pub struct CaSyncService<T: CaBundleTransport, R: SshdReloader> {
     last_success_path: PathBuf,
 }
 
-impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
+impl<T: CaBundleTransport, A: BundleApplier> CaSyncService<T, A> {
     /// Construct a synchronisation service.
     ///
     /// `pinned_signing_key` is the operator-provisioned trust anchor (from
     /// configuration); when `None`, the agent pins the first signing key it sees
-    /// under `signing_key_path`.
+    /// under `signing_key_path`. `applier` is the privileged-apply port (in
+    /// production, the `mayfly-helper` client).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport: T,
-        reloader: R,
+        applier: A,
         clock: Arc<dyn Clock>,
         keypair: MachineKeypair,
         machine_id: String,
         server_url: String,
         pinned_signing_key: Option<String>,
-        trusted_ca_path: PathBuf,
         generation_path: PathBuf,
         fingerprint_path: PathBuf,
         signing_key_path: PathBuf,
@@ -260,13 +267,12 @@ impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
     ) -> Self {
         Self {
             transport,
-            reloader,
+            applier,
             clock,
             keypair,
             machine_id,
             server_url,
             pinned_signing_key,
-            trusted_ca_path,
             generation_path,
             fingerprint_path,
             signing_key_path,
@@ -286,9 +292,12 @@ impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
     /// * [`Error::InvalidCaBundle`] if the response fails authentication or
     ///   validation (bad signature, version, expiry, fingerprint, downgrade).
     /// * [`Error::InvalidTrustedCa`] if the rendered file fails re-parse.
-    /// * [`Error::CaReloadFailed`] if `sshd` could not be reloaded/verified (the
-    ///   previous bundle is restored before this is returned).
-    /// * [`Error::Io`] / [`Error::UnexpectedSymlink`] on filesystem failures.
+    /// * [`Error::CaReloadFailed`] if the helper could not apply the bundle and
+    ///   rolled back to the previous one (generation is not advanced).
+    /// * [`Error::HelperUnavailable`] / [`Error::HelperUnauthenticated`] /
+    ///   [`Error::HelperOperationFailed`] if the privileged apply could not be
+    ///   attempted; the host is left unchanged.
+    /// * [`Error::Io`] on failures writing the agent's own state files.
     pub fn synchronize(&self) -> Result<SyncOutcome> {
         let persisted = self.load_state()?;
 
@@ -362,17 +371,12 @@ impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
                     acknowledged,
                 })
             }
-            ApplyResult::ReloadFailed { rolled_back } => {
-                let error = if rolled_back {
-                    "sshd reload failed; previous bundle restored"
-                } else {
-                    "sshd reload failed; rollback also failed"
-                };
+            ApplyResult::RolledBack => {
                 let report = AckReport {
                     generation: bundle.generation(),
                     fingerprint: bundle.fingerprint().to_string(),
                     status: ACK_STATUS_ROLLBACK.to_string(),
-                    reason: Some(error.to_string()),
+                    reason: Some(ACK_ROLLBACK_REASON.to_string()),
                 };
                 // Report failure but never claim success.
                 let _ = self.acknowledge(&report);
@@ -381,54 +385,29 @@ impl<T: CaBundleTransport, R: SshdReloader> CaSyncService<T, R> {
         }
     }
 
-    /// Replace the `TrustedUserCAKeys` file and reload+verify `sshd`, rolling
-    /// back the file on failure.
+    /// Render the new `TrustedUserCAKeys` body and delegate the privileged apply
+    /// to the [`BundleApplier`] (the `mayfly-helper`), which owns the atomic
+    /// write, `sshd -t`, reload, verify, and rollback.
     ///
-    /// Returns `Err` only for *pre-write* failures (symlink, invalid render,
-    /// I/O); a post-write reload/verify failure is reported via
-    /// [`ApplyResult::ReloadFailed`] after rollback.
+    /// Returns `Err` only when the apply could not be *attempted* (render
+    /// re-parse failure, or the helper being unreachable/unauthenticated); a
+    /// privileged-side failure that the helper safely rolled back is returned as
+    /// [`ApplyResult::RolledBack`].
     fn apply(&self, bundle: &CaBundle) -> Result<ApplyResult> {
-        security::ensure_not_symlink(&self.trusted_ca_path)?;
-        let previous = read_optional(&self.trusted_ca_path)?;
-
         let contents = bundle.render_trusted_user_ca_keys();
-        // Defence in depth: never write a file we cannot parse back.
+        // Defence in depth: never ask the helper to apply a body we cannot parse.
         TrustedCaKeys::parse(&contents)?;
 
-        security::secure_write(
-            &self.trusted_ca_path,
-            contents.as_bytes(),
-            security::MODE_PUBLIC,
-        )?;
-
-        if let Err(err) = self.reload_and_verify() {
-            tracing::error!(
-                path = %self.trusted_ca_path.display(),
-                error = %err,
-                "sshd reload/verify failed; restoring previous CA bundle"
-            );
-            let rolled_back = self.rollback(previous.as_deref()).is_ok();
-            return Ok(ApplyResult::ReloadFailed { rolled_back });
-        }
-        Ok(ApplyResult::Applied)
-    }
-
-    /// Reload `sshd` then verify it accepted the configuration.
-    fn reload_and_verify(&self) -> Result<()> {
-        self.reloader.reload()?;
-        self.reloader.verify()
-    }
-
-    /// Restore the previous trusted-CA file (or remove it if none existed), then
-    /// reload and verify `sshd`. Returns `Ok` only if the full restore succeeds.
-    fn rollback(&self, previous: Option<&[u8]>) -> Result<()> {
-        match previous {
-            Some(bytes) => {
-                security::secure_write(&self.trusted_ca_path, bytes, security::MODE_PUBLIC)?;
+        match self.applier.apply(&contents)? {
+            BundleApplyOutcome::Applied => Ok(ApplyResult::Applied),
+            BundleApplyOutcome::RolledBack => {
+                tracing::error!(
+                    generation = bundle.generation(),
+                    "helper rejected CA bundle apply and restored the previous bundle"
+                );
+                Ok(ApplyResult::RolledBack)
             }
-            None => remove_optional(&self.trusted_ca_path)?,
         }
-        self.reload_and_verify()
     }
 
     /// Determine the signing key the bundle must be verified against: the
@@ -634,18 +613,6 @@ fn read_optional_string(path: &Path) -> Result<Option<String>> {
             } else {
                 Ok(Some(trimmed.to_string()))
             }
-        }
-    }
-}
-
-/// Remove a file, treating a missing file as success.
-fn remove_optional(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "failed to remove file");
-            Err(Error::Io(e))
         }
     }
 }

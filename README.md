@@ -27,8 +27,9 @@ arbitrary commands, open shells, or expose a control plane.
 | `logging`     | Structured `tracing` in JSON or pretty format. |
 | `state`       | `AppState` bundling `Config`, the `Clock`, and startup time. |
 | `identity`    | Ed25519 machine identity, enrollment service, and the production HTTP enrollment client (`api_client`). |
-| `protocol`    | Request signing, the heartbeat client, and the CA-bundle verify/apply/rollback sync service. |
-| `platform`    | Linux/systemd wrappers: `validate_root`, `is_systemd`, host facts (`uname`/IP); `reload_sshd`/`verify_sshd_active` still return `Error::Unsupported`. |
+| `protocol`    | Request signing, the heartbeat client, and the CA-bundle verify/render sync service, which delegates the privileged apply through the `BundleApplier` port. |
+| `ipc`         | The `mayfly-helper` client (`HelperClient`) and `HelperBundleApplier`, the production applier that routes the live apply through the helper over the UDS. |
+| `platform`    | Read-only Linux/systemd inspections: `validate_root`, `is_systemd`, host facts (`uname`/IP). No privileged service-control; that is owned by the helper. |
 | `ssh`         | Parsing/validation of the `TrustedUserCAKeys` file and the sshd `TrustedUserCAKeys` directive. |
 | `service`     | The `Daemon` (startup, enrollment/recovery, poll loop), `Scheduler`, `backoff`, `shutdown`, and persistent `runtime_state`. |
 
@@ -47,10 +48,13 @@ arbitrary commands, open shells, or expose a control plane.
   place.
 - Errors never leak filesystem paths to callers; path context is logged via
   structured `tracing` instead.
-- The privileged service-control wrappers (`reload_sshd`, `restart_sshd`,
-  `verify_sshd_active`) deliberately perform **no action** (they return
-  `Error::Unsupported`) until wired up in a reviewed, later phase; a new CA
-  bundle therefore rolls back rather than being half-applied.
+- The agent runs **unprivileged** and performs no privileged filesystem writes
+  or `sshd` control. Replacing `TrustedUserCAKeys`, validating with `sshd -t`,
+  reloading `sshd`, and rolling back on failure are delegated to the root
+  `mayfly-helper` over an authenticated Unix Domain Socket (`HelperBundleApplier`).
+  If the helper is unreachable a new CA bundle apply fails non-fatally and is
+  retried on the next cadence; the agent never advances its generation unless the
+  helper confirms a successful apply.
 - Enrollment uses a single-use token supplied **only** via the
   `MAYFLY_AGENT_ENROLLMENT_TOKEN` environment variable; it is never written to
   disk. The server-provided bundle signing key is pinned trust-on-first-use.
@@ -115,10 +119,13 @@ src/
 │   ├── signing.rs     # request signing (byte-compatible with the server)
 │   ├── heartbeat.rs   # HeartbeatClient + ReqwestTransport
 │   ├── ca_bundle.rs   # bundle model + canonicalisation + verification
-│   └── ca_sync.rs     # CaSyncService: fetch → verify → apply → reload → ack
+│   └── ca_sync.rs     # CaSyncService: fetch → verify → render → BundleApplier (helper) → ack
+├── ipc/
+│   ├── protocol.rs    # helper socket request/response + framing (byte-identical to helper)
+│   └── client.rs      # HelperClient + HelperBundleApplier (production BundleApplier)
 ├── platform/
 │   ├── linux.rs       # validate_root, effective_uid, host_facts
-│   └── systemd.rs     # is_systemd; reload_sshd/verify_sshd_active (Error::Unsupported)
+│   └── systemd.rs     # is_systemd (read-only); no privileged service-control here
 ├── ssh/
 │   ├── trusted_ca.rs  # TrustedUserCAKeys parsing/validation
 │   └── sshd_config.rs # TrustedUserCAKeys directive inspect/render (read-only)

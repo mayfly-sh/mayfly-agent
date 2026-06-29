@@ -20,13 +20,16 @@
 //! vestigial async call bridged by [`block_on`](crate::service::block_on). No
 //! async runtime is introduced.
 //!
-//! ## Deliberate boundary
+//! ## Privileged boundary
 //!
-//! `sshd` reload/verify is wired through [`SystemdSshdReloader`], which is
-//! `Error::Unsupported` in this build (systemd integration / a root helper are
-//! out of scope for this milestone). On a host without a working reloader a
-//! *new* bundle apply rolls back by design; enrollment, heartbeats, bundle
-//! fetch/verify, `304` handling, and state persistence all operate normally.
+//! The privileged apply — replacing the managed `TrustedUserCAKeys`, validating
+//! with `sshd -t`, reloading `sshd`, and rolling back on failure — is delegated
+//! to the root `mayfly-helper` via [`HelperBundleApplier`] over an authenticated
+//! Unix Domain Socket. The agent runs unprivileged and performs no privileged
+//! filesystem writes itself. If the helper is unreachable a *new* bundle apply
+//! fails non-fatally (logged, retried next cadence); enrollment, heartbeats,
+//! bundle fetch/verify, `304` handling, and state persistence all operate
+//! normally.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -42,10 +45,10 @@ use crate::identity::api_client::{
 };
 use crate::identity::enrollment::{validate_token, EnrollmentService};
 use crate::identity::machine::MachineIdentity;
+use crate::ipc::HelperBundleApplier;
 use crate::platform::linux::{self, HostFacts};
 use crate::platform::systemd;
-use crate::protocol::ca_sync::{CaBundleTransport, SshdReloader, SyncOutcome};
-use crate::protocol::ca_sync::{CaSyncService, SystemdSshdReloader};
+use crate::protocol::ca_sync::{BundleApplier, CaBundleTransport, CaSyncService, SyncOutcome};
 use crate::protocol::heartbeat::{
     HeartbeatClient, HeartbeatRequest, HeartbeatTransport, ReqwestTransport,
 };
@@ -161,15 +164,22 @@ impl Daemon {
             hb_keypair,
             identity.server_url.clone(),
         );
+        // Privileged apply is delegated to the root mayfly-helper over its UDS;
+        // the agent itself never writes the managed TrustedUserCAKeys or reloads
+        // sshd. The applier reads the capability token per call, so a helper
+        // installed (or rotated) after startup is picked up without a restart.
+        let applier = HelperBundleApplier::new(
+            config.helper_socket_path.clone(),
+            config.helper_token_path.clone(),
+        );
         let sync = CaSyncService::new(
             ca_transport,
-            SystemdSshdReloader,
+            applier,
             Arc::clone(&clock),
             sync_keypair,
             identity.machine_id.clone(),
             identity.server_url.clone(),
             config.bundle_signing_public_key.clone(),
-            config.trusted_ca_path.clone(),
             config.generation_path(),
             config.bundle_fingerprint_path(),
             config.bundle_signing_key_path(),
@@ -234,10 +244,10 @@ impl Daemon {
             allow_insecure_tls = config.allow_insecure_tls,
             "mayfly-agent starting"
         );
-        if !running_as_root {
+        if running_as_root {
             tracing::warn!(
-                "not running as root; sshd reload and protected file writes will fail when those \
-                 capabilities are enabled"
+                "running as root is unnecessary; privileged operations are delegated to the \
+                 mayfly-helper. Prefer running the agent unprivileged."
             );
         }
         if config.allow_insecure_tls {
@@ -327,9 +337,9 @@ impl Daemon {
 /// mock clock, fixed RNG, and an advancing/triggering sleeper. Callback errors
 /// are logged and swallowed by [`run_polling`]; the next cadence retries.
 #[allow(clippy::too_many_arguments)]
-pub fn run_poll_loop<T, U, R>(
+pub fn run_poll_loop<T, U, A>(
     heartbeat: &HeartbeatClient<T>,
-    sync: &CaSyncService<U, R>,
+    sync: &CaSyncService<U, A>,
     scheduler: &mut Scheduler,
     clock: &Arc<dyn Clock>,
     rng: &dyn RandomSource,
@@ -342,7 +352,7 @@ pub fn run_poll_loop<T, U, R>(
 ) where
     T: HeartbeatTransport,
     U: CaBundleTransport,
-    R: SshdReloader,
+    A: BundleApplier,
 {
     run_polling(
         scheduler,
@@ -397,8 +407,8 @@ fn record_heartbeat<T: HeartbeatTransport>(
 }
 
 /// Run one CA-sync pass and record the outcome in the runtime status.
-fn record_sync<U: CaBundleTransport, R: SshdReloader>(
-    client: &CaSyncService<U, R>,
+fn record_sync<U: CaBundleTransport, A: BundleApplier>(
+    client: &CaSyncService<U, A>,
     clock: &Arc<dyn Clock>,
     status: &RefCell<RuntimeStatus>,
     config: &Config,

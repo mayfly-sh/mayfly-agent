@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::errors::{Error, Result};
 use crate::ipc::protocol::{self, Operation, Outcome, Request, Response};
+use crate::protocol::ca_sync::{BundleApplier, BundleApplyOutcome};
 
 /// Per-call connect/read/write timeout.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -112,6 +113,39 @@ impl HelperClient {
         check_ok(&resp)
     }
 
+    /// Apply a new `TrustedUserCAKeys` body, distinguishing a helper-side
+    /// rollback from a failure to even attempt the apply.
+    ///
+    /// This is the mapping used by the live CA-sync apply path. Unlike
+    /// [`HelperClient::apply_trusted_ca_keys`], a helper that fails the apply but
+    /// safely restores the previous bundle is reported as
+    /// [`BundleApplyOutcome::RolledBack`] (an `Ok`), so the caller can ack a
+    /// rollback without advancing state. Authentication and transport failures
+    /// remain `Err` (the host was not changed).
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::HelperUnavailable`] / [`Error::HelperProtocol`] on transport or
+    ///   framing failure.
+    /// * [`Error::HelperUnauthenticated`] if the helper rejects the token.
+    /// * [`Error::HelperOperationFailed`] if the helper reports a failure that is
+    ///   not an explicit rollback.
+    pub fn apply_bundle(&self, content: &str) -> Result<BundleApplyOutcome> {
+        let resp = self.call(&Request::apply(&self.token, content))?;
+        if resp.ok {
+            // `Applied`, `NotModified`, and `Ok` all mean the host now trusts
+            // this bundle (or already did).
+            return Ok(BundleApplyOutcome::Applied);
+        }
+        match resp.detail.as_deref() {
+            Some("unauthenticated") => Err(Error::HelperUnauthenticated),
+            // The helper guarantees rollback-safety: on a failed apply it
+            // restores the previous bundle and reports `RolledBack`.
+            _ if resp.outcome == Outcome::RolledBack => Ok(BundleApplyOutcome::RolledBack),
+            _ => Err(Error::HelperOperationFailed),
+        }
+    }
+
     /// Verify the managed files and that `sshd` is healthy.
     ///
     /// # Errors
@@ -120,6 +154,36 @@ impl HelperClient {
     pub fn verify_state(&self) -> Result<()> {
         let resp = self.call(&Request::new(&self.token, Operation::VerifyState))?;
         check_ok(&resp).map(|_| ())
+    }
+}
+
+/// The production [`BundleApplier`]: delegates the privileged apply to the
+/// `mayfly-helper` over its socket.
+///
+/// It holds the socket and token *paths* (not a constructed client) and reads
+/// the capability token on each apply. This means a token rotation, or a helper
+/// installed after the agent started, is picked up without restarting the agent;
+/// it also keeps the (rarely used) token out of long-lived memory.
+#[derive(Debug, Clone)]
+pub struct HelperBundleApplier {
+    socket_path: PathBuf,
+    token_path: PathBuf,
+}
+
+impl HelperBundleApplier {
+    /// Construct from the helper socket path and capability-token file path.
+    pub fn new(socket_path: PathBuf, token_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            token_path,
+        }
+    }
+}
+
+impl BundleApplier for HelperBundleApplier {
+    fn apply(&self, trusted_ca_keys: &str) -> Result<BundleApplyOutcome> {
+        let client = HelperClient::from_paths(self.socket_path.clone(), &self.token_path)?;
+        client.apply_bundle(trusted_ca_keys)
     }
 }
 
@@ -175,6 +239,10 @@ mod tests {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // The accepted stream may inherit the listener's
+                        // non-blocking flag on some platforms; force blocking so
+                        // the frame read waits for the client's bytes.
+                        let _ = stream.set_nonblocking(false);
                         let response = match protocol::read_frame(&mut stream) {
                             Ok(body) => match protocol::decode_request(&body) {
                                 Ok(req) if req.protocol_version != PROTOCOL_VERSION => {
@@ -259,5 +327,144 @@ mod tests {
         std::fs::write(&token_path, "file-token\n").unwrap();
         let client = HelperClient::from_paths(dir.path().join("helper.sock"), &token_path).unwrap();
         assert_eq!(client.token, "file-token");
+    }
+
+    /// Spawn a mock helper that token-checks then replies to an `ApplyTrustedCa`
+    /// request with a fixed [`Response`], so the apply→outcome mapping can be
+    /// exercised over the real socket/framing.
+    fn spawn_apply_server(
+        expected_token: &str,
+        reply: Response,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("helper.sock");
+        let client_socket = socket.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let expected = expected_token.to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The accepted stream may inherit the listener's
+                        // non-blocking flag on some platforms; force blocking so
+                        // the frame read waits for the client's bytes.
+                        let _ = stream.set_nonblocking(false);
+                        let response = match protocol::read_frame(&mut stream) {
+                            Ok(body) => match protocol::decode_request(&body) {
+                                Ok(req)
+                                    if !protocol::constant_time_eq(
+                                        req.token.as_bytes(),
+                                        expected.as_bytes(),
+                                    ) =>
+                                {
+                                    Response::failure(Outcome::Unhealthy, "unauthenticated")
+                                }
+                                Ok(_) => reply.clone(),
+                                Err(_) => Response::failure(Outcome::Unhealthy, "protocol error"),
+                            },
+                            Err(_) => Response::failure(Outcome::Unhealthy, "protocol error"),
+                        };
+                        if let Ok(body) = protocol::encode_response(&response) {
+                            let _ = protocol::write_frame(&mut stream, &body);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let _ = std::fs::remove_file(&socket);
+        });
+
+        (dir, client_socket, stop, handle)
+    }
+
+    #[test]
+    fn apply_bundle_maps_ok_response_to_applied() {
+        let (_dir, socket, stop, handle) =
+            spawn_apply_server("tok", Response::success(Outcome::Applied));
+        let client = HelperClient::new(socket, "tok".to_string());
+        assert_eq!(
+            client.apply_bundle("body").unwrap(),
+            BundleApplyOutcome::Applied
+        );
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn apply_bundle_maps_rolled_back_failure_to_rolled_back() {
+        let (_dir, socket, stop, handle) = spawn_apply_server(
+            "tok",
+            Response::failure(Outcome::RolledBack, "sshd -t failed"),
+        );
+        let client = HelperClient::new(socket, "tok".to_string());
+        assert_eq!(
+            client.apply_bundle("body").unwrap(),
+            BundleApplyOutcome::RolledBack
+        );
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn apply_bundle_maps_other_failure_to_operation_failed() {
+        let (_dir, socket, stop, handle) =
+            spawn_apply_server("tok", Response::failure(Outcome::Unhealthy, "boom"));
+        let client = HelperClient::new(socket, "tok".to_string());
+        assert!(matches!(
+            client.apply_bundle("body").unwrap_err(),
+            Error::HelperOperationFailed
+        ));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn apply_bundle_wrong_token_is_unauthenticated() {
+        let (_dir, socket, stop, handle) =
+            spawn_apply_server("real-token", Response::success(Outcome::Applied));
+        let client = HelperClient::new(socket, "wrong-token".to_string());
+        assert!(matches!(
+            client.apply_bundle("body").unwrap_err(),
+            Error::HelperUnauthenticated
+        ));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn helper_bundle_applier_applies_over_socket() {
+        let (dir, socket, stop, handle) =
+            spawn_apply_server("tok", Response::success(Outcome::Applied));
+        let token_path = dir.path().join("helper.token");
+        std::fs::write(&token_path, "tok\n").unwrap();
+
+        let applier = HelperBundleApplier::new(socket, token_path);
+        assert_eq!(applier.apply("body").unwrap(), BundleApplyOutcome::Applied);
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn helper_bundle_applier_missing_token_errors_without_changing_host() {
+        // No token file present: the apply cannot be attempted and returns Err.
+        let dir = tempfile::tempdir().unwrap();
+        let applier = HelperBundleApplier::new(
+            dir.path().join("helper.sock"),
+            dir.path().join("absent.token"),
+        );
+        assert!(applier.apply("body").is_err());
     }
 }

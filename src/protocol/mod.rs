@@ -9,8 +9,9 @@
 //!   heartbeat over a pluggable [`heartbeat::HeartbeatTransport`].
 //! * [`ca_bundle`] — the pure CA-bundle model: parsing, validation, canonical
 //!   fingerprinting, and `TrustedUserCAKeys` rendering.
-//! * [`ca_sync`] — the [`ca_sync::CaSyncService`] that fetches, verifies,
-//!   atomically applies, reloads, persists, and acknowledges a bundle.
+//! * [`ca_sync`] — the [`ca_sync::CaSyncService`] that fetches, verifies, and
+//!   then delegates the privileged apply (via the [`ca_sync::BundleApplier`]
+//!   port) to the `mayfly-helper`, persists, and acknowledges a bundle.
 
 pub mod ca_bundle;
 pub mod ca_sync;
@@ -23,7 +24,7 @@ pub use ca_bundle::{
     MAX_KEYS, MIN_KEYS, SIGNATURE_ALGORITHM, SUPPORTED_BUNDLE_VERSION,
 };
 pub use ca_sync::{
-    AckReport, CaBundleTransport, CaSyncService, SshdReloader, SyncOutcome, SystemdSshdReloader,
+    AckReport, BundleApplier, BundleApplyOutcome, CaBundleTransport, CaSyncService, SyncOutcome,
 };
 pub use heartbeat::{
     HeartbeatClient, HeartbeatRequest, HeartbeatResponse, HeartbeatTransport, HttpRequest,

@@ -1,12 +1,10 @@
 //! Linux platform abstraction.
 //!
-//! This module groups the host-specific operations the daemon will eventually
-//! perform. In this foundation phase the wrappers exist to fix the architecture
-//! and signatures; the operations that would mutate system state (restarting or
-//! reloading `sshd`) deliberately perform **no action** and return
-//! [`Error::Unsupported`](crate::errors::Error::Unsupported). The read-only
-//! inspections ([`linux::validate_root`], [`systemd::is_systemd`]) are
-//! implemented, since they change nothing.
+//! This module groups the read-only host inspections the daemon performs
+//! ([`linux::validate_root`], [`linux::host_facts`], [`systemd::is_systemd`]).
+//! The agent holds no privileged service-control capability: mutating system
+//! state (replacing `TrustedUserCAKeys`, validating/reloading `sshd`) is owned
+//! entirely by the root `mayfly-helper` and reached via [`crate::ipc`].
 
 pub mod linux;
 pub mod systemd;

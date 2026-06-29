@@ -140,6 +140,11 @@ pub struct Config {
     pub sync_interval: Duration,
 
     /// Absolute path to the managed `TrustedUserCAKeys` file.
+    ///
+    /// This is **informational** on the agent side: since BL-015 the privileged
+    /// write is owned by the `mayfly-helper`, which holds the authoritative path
+    /// (its own `MAYFLY_HELPER_TRUSTED_CA_PATH`). The field is retained for
+    /// operator reference and config compatibility; the agent does not write it.
     #[serde(default = "default_trusted_ca_path")]
     pub trusted_ca_path: PathBuf,
 

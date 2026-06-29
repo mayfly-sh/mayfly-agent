@@ -141,70 +141,68 @@ fn clone_result(r: &Result<HttpResponse>) -> Result<HttpResponse> {
     }
 }
 
-/// A reloader whose reload/verify failures can be transient (fail the first N
-/// calls, then succeed) so both happy-rollback and broken-rollback paths can be
-/// exercised deterministically.
-struct MockReloader {
-    reload_fail_remaining: Mutex<u32>,
-    verify_fail_remaining: Mutex<u32>,
-    reloads: Mutex<u32>,
-    verifies: Mutex<u32>,
+/// What the mock privileged applier should do when invoked.
+#[derive(Clone, Copy)]
+enum MockApplyResult {
+    /// The helper applied the bundle and `sshd` is healthy.
+    Applied,
+    /// The helper failed and restored the previous bundle (fail-closed).
+    RolledBack,
+    /// The helper could not be reached; nothing was changed.
+    Unavailable,
 }
 
-impl MockReloader {
-    fn make(reload_fails: u32, verify_fails: u32) -> Self {
+/// A mock privileged applier standing in for the `mayfly-helper`. It records the
+/// rendered `TrustedUserCAKeys` body it was asked to apply and the call count,
+/// so tests can prove the helper received exactly the rendered request and was
+/// (or was not) invoked.
+struct MockApplier {
+    result: Mutex<MockApplyResult>,
+    last_contents: Mutex<Option<String>>,
+    calls: Mutex<u32>,
+}
+
+impl MockApplier {
+    fn new(result: MockApplyResult) -> Self {
         Self {
-            reload_fail_remaining: Mutex::new(reload_fails),
-            verify_fail_remaining: Mutex::new(verify_fails),
-            reloads: Mutex::new(0),
-            verifies: Mutex::new(0),
+            result: Mutex::new(result),
+            last_contents: Mutex::new(None),
+            calls: Mutex::new(0),
         }
     }
 
+    /// The helper applies cleanly.
     fn healthy() -> Self {
-        Self::make(0, 0)
+        Self::new(MockApplyResult::Applied)
     }
 
-    /// Reload fails once (the apply), then succeeds (the rollback).
-    fn reload_fails_first() -> Self {
-        Self::make(1, 0)
+    /// The helper fails the apply and rolls back to the previous bundle.
+    fn rolls_back() -> Self {
+        Self::new(MockApplyResult::RolledBack)
     }
 
-    /// Verify fails once (the apply), then succeeds (the rollback).
-    fn verify_fails_first() -> Self {
-        Self::make(0, 1)
+    /// The helper is unreachable.
+    fn unavailable() -> Self {
+        Self::new(MockApplyResult::Unavailable)
     }
 
-    /// Reload never succeeds, so even rollback cannot restore service.
-    fn reload_always_fails() -> Self {
-        Self::make(u32::MAX, 0)
+    fn calls(&self) -> u32 {
+        *self.calls.lock().unwrap()
     }
 
-    fn reloads(&self) -> u32 {
-        *self.reloads.lock().unwrap()
+    fn last_contents(&self) -> Option<String> {
+        self.last_contents.lock().unwrap().clone()
     }
 }
 
-impl SshdReloader for MockReloader {
-    fn reload(&self) -> Result<()> {
-        *self.reloads.lock().unwrap() += 1;
-        let mut remaining = self.reload_fail_remaining.lock().unwrap();
-        if *remaining > 0 {
-            *remaining -= 1;
-            Err(Error::Unsupported)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn verify(&self) -> Result<()> {
-        *self.verifies.lock().unwrap() += 1;
-        let mut remaining = self.verify_fail_remaining.lock().unwrap();
-        if *remaining > 0 {
-            *remaining -= 1;
-            Err(Error::Unsupported)
-        } else {
-            Ok(())
+impl BundleApplier for MockApplier {
+    fn apply(&self, trusted_ca_keys: &str) -> Result<BundleApplyOutcome> {
+        *self.calls.lock().unwrap() += 1;
+        *self.last_contents.lock().unwrap() = Some(trusted_ca_keys.to_string());
+        match *self.result.lock().unwrap() {
+            MockApplyResult::Applied => Ok(BundleApplyOutcome::Applied),
+            MockApplyResult::RolledBack => Ok(BundleApplyOutcome::RolledBack),
+            MockApplyResult::Unavailable => Err(Error::HelperUnavailable),
         }
     }
 }
@@ -230,24 +228,20 @@ impl Harness {
     fn p(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
-    fn ca_path(&self) -> PathBuf {
-        self.p("trusted_user_ca_keys")
-    }
 
-    fn service<T: CaBundleTransport, R: SshdReloader>(
+    fn service<T: CaBundleTransport, A: BundleApplier>(
         &self,
         transport: T,
-        reloader: R,
-    ) -> CaSyncService<T, R> {
+        applier: A,
+    ) -> CaSyncService<T, A> {
         CaSyncService::new(
             transport,
-            reloader,
+            applier,
             Arc::new(FixedClock::from_unix(NOW_UNIX)),
             MachineKeypair::generate().unwrap(),
             "srv_abc".to_string(),
             "https://mayfly.example.com".to_string(),
             self.pin.clone(),
-            self.ca_path(),
             self.p("current_generation"),
             self.p("current_bundle.sha256"),
             self.p("bundle_signing_key.pub"),
@@ -268,7 +262,7 @@ fn updates_on_new_signed_bundle_and_acks() {
     let pk = pubkey();
     let service = h.service(
         MockTransport::new(ok(bundle_body(&signer, 42, &[("ca-01", &pk)]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
 
     let outcome = service.synchronize().unwrap();
@@ -284,7 +278,10 @@ fn updates_on_new_signed_bundle_and_acks() {
         other => panic!("expected Updated, got {other:?}"),
     }
 
-    let written = std::fs::read_to_string(h.ca_path()).unwrap();
+    // The rendered body was handed to the privileged applier (the helper),
+    // exactly once — the agent itself wrote no TrustedUserCAKeys file.
+    assert_eq!(service.applier.calls(), 1);
+    let written = service.applier.last_contents().unwrap();
     assert!(written.starts_with("# Managed by mayfly-agent"));
     assert!(written.contains("mayfly:ca-01"));
     assert_eq!(
@@ -323,15 +320,15 @@ fn skips_everything_on_304() {
             status: 304,
             body: Vec::new(),
         })),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
 
     assert_eq!(
         service.synchronize().unwrap(),
         SyncOutcome::NotModified { generation: 42 }
     );
-    assert_eq!(service.reloader.reloads(), 0);
-    assert!(!h.ca_path().exists());
+    // A 304 must never reach the privileged applier.
+    assert_eq!(service.applier.calls(), 0);
 
     // The persisted fingerprint was sent as a quoted If-None-Match ETag.
     let get = service.transport.last_get.lock().unwrap().clone().unwrap();
@@ -359,13 +356,13 @@ fn no_op_when_validated_bundle_already_applied() {
     std::fs::write(h.p("current_generation"), "7\n").unwrap();
     std::fs::write(h.p("current_bundle.sha256"), format!("{fingerprint}\n")).unwrap();
 
-    let service = h.service(MockTransport::new(ok(body)), MockReloader::healthy());
+    let service = h.service(MockTransport::new(ok(body)), MockApplier::healthy());
     assert_eq!(
         service.synchronize().unwrap(),
         SyncOutcome::Unchanged { generation: 7 }
     );
-    assert_eq!(service.reloader.reloads(), 0);
-    assert!(!h.ca_path().exists());
+    // An already-applied bundle must never reach the privileged applier.
+    assert_eq!(service.applier.calls(), 0);
 }
 
 #[test]
@@ -376,7 +373,7 @@ fn rejects_signing_key_swap_against_persisted_pin() {
     // First sync pins the original signer.
     h.service(
         MockTransport::new(ok(bundle_body(&original, 1, &[("ca-01", &pk)]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     )
     .synchronize()
     .unwrap();
@@ -385,7 +382,7 @@ fn rejects_signing_key_swap_against_persisted_pin() {
     let attacker = TestSigner::new(2);
     let service = h.service(
         MockTransport::new(ok(bundle_body(&attacker, 2, &[("ca-02", &pubkey())]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     assert!(matches!(
         service.synchronize().unwrap_err(),
@@ -401,7 +398,7 @@ fn rejects_generation_downgrade() {
     // Apply generation 5.
     h.service(
         MockTransport::new(ok(bundle_body(&signer, 5, &[("ca-01", &pk)]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     )
     .synchronize()
     .unwrap();
@@ -409,7 +406,7 @@ fn rejects_generation_downgrade() {
     // Server (or attacker) offers an older, validly-signed generation 3.
     let service = h.service(
         MockTransport::new(ok(bundle_body(&signer, 3, &[("ca-01", &pk)]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     assert!(matches!(
         service.synchronize().unwrap_err(),
@@ -418,76 +415,66 @@ fn rejects_generation_downgrade() {
 }
 
 #[test]
-fn rolls_back_on_reload_failure() {
+fn helper_rollback_does_not_advance_generation_and_acks_rollback() {
+    // The helper received the apply, failed it, and restored the previous bundle
+    // (it owns rollback). The agent must report CaReloadFailed, never advance its
+    // generation, and ack a rollback (never success).
     let h = Harness::new();
-    std::fs::write(h.ca_path(), "PREVIOUS\n").unwrap();
+    std::fs::write(h.p("current_generation"), "1\n").unwrap();
     let signer = TestSigner::new(3);
     let pk = pubkey();
     let service = h.service(
         MockTransport::new(ok(bundle_body(&signer, 99, &[("ca-01", &pk)]))),
-        MockReloader::reload_fails_first(),
+        MockApplier::rolls_back(),
     );
 
     assert!(matches!(
         service.synchronize().unwrap_err(),
         Error::CaReloadFailed
     ));
-    assert_eq!(std::fs::read_to_string(h.ca_path()).unwrap(), "PREVIOUS\n");
+    // The helper was asked exactly once, with the rendered body.
+    assert_eq!(service.applier.calls(), 1);
+    assert!(service
+        .applier
+        .last_contents()
+        .unwrap()
+        .contains("mayfly:ca-01"));
+    // Persisted generation is unchanged (still the previous, applied value).
+    assert_eq!(
+        std::fs::read_to_string(h.p("current_generation"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+
+    // A failure ack was reported with status=rollback (and a fixed reason).
+    let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
+    let body = String::from_utf8(ack.body).unwrap();
+    assert!(body.contains("\"status\":\"rollback\""));
+    assert!(body.contains("previous bundle restored"));
+}
+
+#[test]
+fn helper_unavailable_propagates_and_sends_no_ack() {
+    // If the privileged apply cannot even be attempted (helper down), the host is
+    // unchanged: propagate the error, advance nothing, and send no ack — there is
+    // no apply outcome to acknowledge.
+    let h = Harness::new();
+    let signer = TestSigner::new(3);
+    let pk = pubkey();
+    let service = h.service(
+        MockTransport::new(ok(bundle_body(&signer, 99, &[("ca-01", &pk)]))),
+        MockApplier::unavailable(),
+    );
+
+    assert!(matches!(
+        service.synchronize().unwrap_err(),
+        Error::HelperUnavailable
+    ));
+    assert_eq!(service.applier.calls(), 1);
     assert!(!h.p("current_generation").exists());
-    // Reload attempted twice: once for the new file, once after restoring.
-    assert_eq!(service.reloader.reloads(), 2);
-
-    // A failure ack was still reported (status=rollback), and rollback succeeded.
-    let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
-    let body = String::from_utf8(ack.body).unwrap();
-    assert!(body.contains("\"status\":\"rollback\""));
-    assert!(body.contains("previous bundle restored"));
-}
-
-#[test]
-fn rolls_back_on_verify_failure() {
-    let h = Harness::new();
-    std::fs::write(h.ca_path(), "PREVIOUS\n").unwrap();
-    let signer = TestSigner::new(3);
-    let pk = pubkey();
-    let service = h.service(
-        MockTransport::new(ok(bundle_body(&signer, 99, &[("ca-01", &pk)]))),
-        MockReloader::verify_fails_first(),
-    );
-
-    assert!(matches!(
-        service.synchronize().unwrap_err(),
-        Error::CaReloadFailed
-    ));
-    // Previous content restored even though reload() "succeeded" but verify failed.
-    assert_eq!(std::fs::read_to_string(h.ca_path()).unwrap(), "PREVIOUS\n");
-    let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
-    let body = String::from_utf8(ack.body).unwrap();
-    assert!(body.contains("previous bundle restored"));
-}
-
-#[test]
-fn reports_rollback_failure_when_sshd_permanently_broken() {
-    let h = Harness::new();
-    std::fs::write(h.ca_path(), "PREVIOUS\n").unwrap();
-    let signer = TestSigner::new(3);
-    let pk = pubkey();
-    let service = h.service(
-        MockTransport::new(ok(bundle_body(&signer, 99, &[("ca-01", &pk)]))),
-        MockReloader::reload_always_fails(),
-    );
-
-    assert!(matches!(
-        service.synchronize().unwrap_err(),
-        Error::CaReloadFailed
-    ));
-    // The file content was still restored even though sshd cannot be reloaded.
-    assert_eq!(std::fs::read_to_string(h.ca_path()).unwrap(), "PREVIOUS\n");
-    // The ack must NOT claim success; it reports the rollback could not complete.
-    let ack = service.transport.last_ack.lock().unwrap().clone().unwrap();
-    let body = String::from_utf8(ack.body).unwrap();
-    assert!(body.contains("\"status\":\"rollback\""));
-    assert!(body.contains("rollback also failed"));
+    // No acknowledgement was sent.
+    assert!(service.transport.last_ack.lock().unwrap().is_none());
 }
 
 #[test]
@@ -498,7 +485,7 @@ fn rejected_status_is_error() {
             status: 401,
             body: b"{}".to_vec(),
         })),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     assert!(matches!(
         service.synchronize().unwrap_err(),
@@ -523,13 +510,14 @@ fn invalid_signature_is_rejected_before_write() {
     let tampered = format!("{}{valid_len_wrong_sig}{}", &text[..start], &text[end..]);
     let service = h.service(
         MockTransport::new(ok(tampered.into_bytes())),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     assert!(matches!(
         service.synchronize().unwrap_err(),
         Error::InvalidCaBundle(crate::errors::CaBundleError::SignatureInvalid)
     ));
-    assert!(!h.ca_path().exists());
+    // An unauthenticated bundle must be rejected before reaching the helper.
+    assert_eq!(service.applier.calls(), 0);
 }
 
 #[test]
@@ -543,7 +531,7 @@ fn unsupported_version_is_rejected() {
         .replace("\"bundle_version\":1", "\"bundle_version\":2");
     let service = h.service(
         MockTransport::new(ok(text.into_bytes())),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     assert!(matches!(
         service.synchronize().unwrap_err(),
@@ -560,7 +548,7 @@ fn operator_pin_overrides_and_rejects_other_signers() {
     let attacker = TestSigner::new(21);
     let service = h.service(
         MockTransport::new(ok(bundle_body(&attacker, 1, &[("ca-01", &pubkey())]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     assert!(matches!(
         service.synchronize().unwrap_err(),
@@ -576,7 +564,7 @@ fn ack_failure_is_non_fatal() {
     let service = h.service(
         MockTransport::new(ok(bundle_body(&signer, 5, &[("ca-01", &pk)])))
             .with_ack(Err(Error::CaBundleTransport)),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     match service.synchronize().unwrap() {
         SyncOutcome::Updated { acknowledged, .. } => assert!(!acknowledged),
@@ -591,24 +579,6 @@ fn ack_failure_is_non_fatal() {
 }
 
 #[test]
-fn rejects_symlinked_trusted_ca_path() {
-    let h = Harness::new();
-    let target = h.dir.path().join("real_target");
-    std::fs::write(&target, "x").unwrap();
-    std::os::unix::fs::symlink(&target, h.ca_path()).unwrap();
-
-    let signer = TestSigner::new(8);
-    let service = h.service(
-        MockTransport::new(ok(bundle_body(&signer, 1, &[("ca-01", &pubkey())]))),
-        MockReloader::healthy(),
-    );
-    assert!(matches!(
-        service.synchronize().unwrap_err(),
-        Error::UnexpectedSymlink
-    ));
-}
-
-#[test]
 fn second_pass_sends_etag_from_persisted_fingerprint() {
     let h = Harness::new();
     let signer = TestSigner::new(6);
@@ -616,7 +586,7 @@ fn second_pass_sends_etag_from_persisted_fingerprint() {
     // First pass applies and persists a fingerprint.
     h.service(
         MockTransport::new(ok(bundle_body(&signer, 1, &[("ca-01", &pk)]))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     )
     .synchronize()
     .unwrap();
@@ -632,7 +602,7 @@ fn second_pass_sends_etag_from_persisted_fingerprint() {
             2,
             &[("ca-01", &pk), ("ca-02", &pubkey())],
         ))),
-        MockReloader::healthy(),
+        MockApplier::healthy(),
     );
     service.synchronize().unwrap();
     let get = service.transport.last_get.lock().unwrap().clone().unwrap();

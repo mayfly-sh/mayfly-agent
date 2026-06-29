@@ -3,8 +3,11 @@
 //! These drive [`CaSyncService`] through a complete lifecycle against an
 //! in-memory simulated server that **signs** bundles with an Ed25519
 //! bundle-signing key, honours `If-None-Match` (ETag = fingerprint), and records
-//! acknowledgements — plus a mock `sshd` reloader, a real temp-dir filesystem,
-//! and a fixed clock.
+//! acknowledgements — plus a stateful mock privileged applier that stands in for
+//! the `mayfly-helper` (it stores the applied `TrustedUserCAKeys` body and, when
+//! unhealthy, fails the apply while preserving the previously-applied body, just
+//! as the real helper rolls back). A real temp-dir filesystem holds the agent's
+//! own state files, with a fixed clock.
 //!
 //! No sleeps, no network, and no real `systemctl` are involved.
 
@@ -26,7 +29,7 @@ use mayfly_agent::protocol::ca_bundle::{
     SIGNATURE_ALGORITHM, SUPPORTED_BUNDLE_VERSION,
 };
 use mayfly_agent::protocol::ca_sync::{
-    CaBundleTransport, CaSyncService, SshdReloader, SyncOutcome,
+    BundleApplier, BundleApplyOutcome, CaBundleTransport, CaSyncService, SyncOutcome,
 };
 use mayfly_agent::protocol::heartbeat::{HttpRequest, HttpResponse};
 
@@ -156,27 +159,46 @@ impl CaBundleTransport for SimTransport {
     }
 }
 
-/// A reloader whose health (reload + verify) is toggleable mid-test.
-struct ToggleReloader {
+/// A stateful mock privileged applier standing in for the `mayfly-helper`.
+///
+/// When healthy it stores the applied body (the simulated host
+/// `TrustedUserCAKeys`). When unhealthy it fails the apply and reports a
+/// rollback while leaving the stored body untouched — modelling the helper's
+/// rollback-safety guarantee (the previous bundle is restored).
+#[derive(Clone)]
+struct MockHelper {
     healthy: Arc<Mutex<bool>>,
-    reloads: Arc<Mutex<u32>>,
+    applied: Arc<Mutex<Option<String>>>,
+    applies: Arc<Mutex<u32>>,
 }
 
-impl SshdReloader for ToggleReloader {
-    fn reload(&self) -> Result<()> {
-        *self.reloads.lock().unwrap() += 1;
-        if *self.healthy.lock().unwrap() {
-            Ok(())
-        } else {
-            Err(Error::Unsupported)
+impl MockHelper {
+    fn new() -> Self {
+        Self {
+            healthy: Arc::new(Mutex::new(true)),
+            applied: Arc::new(Mutex::new(None)),
+            applies: Arc::new(Mutex::new(0)),
         }
     }
 
-    fn verify(&self) -> Result<()> {
+    fn applied(&self) -> Option<String> {
+        self.applied.lock().unwrap().clone()
+    }
+
+    fn applies(&self) -> u32 {
+        *self.applies.lock().unwrap()
+    }
+}
+
+impl BundleApplier for MockHelper {
+    fn apply(&self, trusted_ca_keys: &str) -> Result<BundleApplyOutcome> {
+        *self.applies.lock().unwrap() += 1;
         if *self.healthy.lock().unwrap() {
-            Ok(())
+            *self.applied.lock().unwrap() = Some(trusted_ca_keys.to_string());
+            Ok(BundleApplyOutcome::Applied)
         } else {
-            Err(Error::Unsupported)
+            // Fail-closed: the previous stored body is preserved (rolled back).
+            Ok(BundleApplyOutcome::RolledBack)
         }
     }
 }
@@ -184,17 +206,18 @@ impl SshdReloader for ToggleReloader {
 struct Fixture {
     dir: tempfile::TempDir,
     server: Arc<Mutex<SimServer>>,
+    helper: MockHelper,
     healthy: Arc<Mutex<bool>>,
-    reloads: Arc<Mutex<u32>>,
 }
 
 impl Fixture {
     fn new(server: SimServer) -> Self {
+        let helper = MockHelper::new();
         Self {
             dir: tempfile::tempdir().unwrap(),
             server: Arc::new(Mutex::new(server)),
-            healthy: Arc::new(Mutex::new(true)),
-            reloads: Arc::new(Mutex::new(0)),
+            healthy: helper.healthy.clone(),
+            helper,
         }
     }
 
@@ -202,21 +225,17 @@ impl Fixture {
         self.dir.path().join(name)
     }
 
-    fn service(&self) -> CaSyncService<SimTransport, ToggleReloader> {
+    fn service(&self) -> CaSyncService<SimTransport, MockHelper> {
         CaSyncService::new(
             SimTransport {
                 server: self.server.clone(),
             },
-            ToggleReloader {
-                healthy: self.healthy.clone(),
-                reloads: self.reloads.clone(),
-            },
+            self.helper.clone(),
             Arc::new(FixedClock::from_unix(NOW_UNIX)),
             MachineKeypair::generate().unwrap(),
             "srv_integration".to_string(),
             "https://mayfly.example.com".to_string(),
             None,
-            self.p("trusted_user_ca_keys"),
             self.p("current_generation"),
             self.p("current_bundle.sha256"),
             self.p("bundle_signing_key.pub"),
@@ -250,7 +269,8 @@ fn full_lifecycle_download_verify_apply_ack_then_304_then_update() {
             ..
         }
     ));
-    assert!(fx.p("trusted_user_ca_keys").exists());
+    // The privileged apply was delegated to the helper, which now holds the body.
+    assert!(fx.helper.applied().unwrap().contains("mayfly:ca-01"));
     assert_eq!(
         std::fs::read_to_string(fx.p("current_generation"))
             .unwrap()
@@ -289,7 +309,7 @@ fn full_lifecycle_download_verify_apply_ack_then_304_then_update() {
         SyncOutcome::Updated { generation: 2, .. }
     ));
 
-    let rendered = std::fs::read_to_string(fx.p("trusted_user_ca_keys")).unwrap();
+    let rendered = fx.helper.applied().unwrap();
     assert!(rendered.contains("mayfly:ca-01"));
     assert!(rendered.contains("mayfly:ca-02"));
     assert!(rendered.contains("# generation: 2"));
@@ -299,9 +319,9 @@ fn full_lifecycle_download_verify_apply_ack_then_304_then_update() {
 fn reload_failure_rolls_back_and_preserves_previous_generation() {
     let fx = Fixture::new(SimServer::new(1, 1, vec![server_key("ca-01")]));
     fx.service().synchronize().unwrap();
-    let applied = std::fs::read_to_string(fx.p("trusted_user_ca_keys")).unwrap();
+    let applied = fx.helper.applied().unwrap();
 
-    // Server rotates; sshd reload now fails.
+    // Server rotates; the helper's apply now fails (and rolls back).
     {
         let mut server = fx.server.lock().unwrap();
         server.generation = 2;
@@ -313,11 +333,8 @@ fn reload_failure_rolls_back_and_preserves_previous_generation() {
         fx.service().synchronize().unwrap_err(),
         Error::CaReloadFailed
     ));
-    // Previous bundle restored; persisted generation still 1.
-    assert_eq!(
-        std::fs::read_to_string(fx.p("trusted_user_ca_keys")).unwrap(),
-        applied
-    );
+    // Previous bundle restored by the helper; persisted generation still 1.
+    assert_eq!(fx.helper.applied().unwrap(), applied);
     assert_eq!(
         std::fs::read_to_string(fx.p("current_generation"))
             .unwrap()
@@ -325,7 +342,7 @@ fn reload_failure_rolls_back_and_preserves_previous_generation() {
         "1"
     );
 
-    // sshd recovers; next pass cleanly advances to generation 2.
+    // The helper recovers; next pass cleanly advances to generation 2.
     *fx.healthy.lock().unwrap() = true;
     assert!(matches!(
         fx.service().synchronize().unwrap(),
@@ -343,7 +360,8 @@ fn rejects_expired_bundle() {
         fx.service().synchronize().unwrap_err(),
         Error::InvalidCaBundle(_)
     ));
-    assert!(!fx.p("trusted_user_ca_keys").exists());
+    // An expired bundle must be rejected before reaching the helper.
+    assert_eq!(fx.helper.applies(), 0);
 }
 
 #[test]
@@ -376,16 +394,12 @@ fn rejects_tampered_bundle_body() {
                 server: fx.server.clone(),
             },
         },
-        ToggleReloader {
-            healthy: fx.healthy.clone(),
-            reloads: fx.reloads.clone(),
-        },
+        fx.helper.clone(),
         Arc::new(FixedClock::from_unix(NOW_UNIX)),
         MachineKeypair::generate().unwrap(),
         "srv_integration".to_string(),
         "https://mayfly.example.com".to_string(),
         None,
-        fx.p("trusted_user_ca_keys"),
         fx.p("current_generation"),
         fx.p("current_bundle.sha256"),
         fx.p("bundle_signing_key.pub"),
@@ -396,7 +410,8 @@ fn rejects_tampered_bundle_body() {
         service.synchronize().unwrap_err(),
         Error::InvalidCaBundle(_)
     ));
-    assert!(!fx.p("trusted_user_ca_keys").exists());
+    // A tampered bundle must be rejected before reaching the helper.
+    assert_eq!(fx.helper.applies(), 0);
 }
 
 #[test]
@@ -410,7 +425,8 @@ fn idempotent_repeated_syncs_do_not_rewrite() {
         fx.service().synchronize().unwrap(),
         SyncOutcome::Updated { generation: 5, .. }
     ));
-    let reloads_after_first = *fx.reloads.lock().unwrap();
+    let applies_after_first = fx.helper.applies();
+    assert_eq!(applies_after_first, 1);
 
     for _ in 0..3 {
         assert_eq!(
@@ -418,5 +434,6 @@ fn idempotent_repeated_syncs_do_not_rewrite() {
             SyncOutcome::NotModified { generation: 5 }
         );
     }
-    assert_eq!(*fx.reloads.lock().unwrap(), reloads_after_first);
+    // Repeated 304 syncs never re-invoke the privileged apply.
+    assert_eq!(fx.helper.applies(), applies_after_first);
 }

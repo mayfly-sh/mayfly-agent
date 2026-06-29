@@ -1,14 +1,12 @@
 //! systemd-specific operations.
 //!
-//! [`is_systemd`] is a read-only detection and is implemented. [`reload_sshd`]
-//! and [`restart_sshd`] are architecture-only in this phase: they intentionally
-//! perform **no action** and return [`Error::Unsupported`]. Wiring them to the
-//! service manager is deferred to a later phase so that this security-sensitive
-//! capability is added deliberately and reviewed in isolation.
+//! [`is_systemd`] is a read-only init-system detection used for diagnostics and
+//! startup validation. The agent holds **no** privileged service-control
+//! capability: reloading/validating `sshd` is owned entirely by the root
+//! `mayfly-helper` (reached via [`crate::ipc`]), so no `reload_sshd`/`restart`
+//! wrappers exist here.
 
 use std::path::Path;
-
-use crate::errors::{Error, Result};
 
 /// The marker directory systemd creates when it is the init system.
 const SYSTEMD_RUNTIME_MARKER: &str = "/run/systemd/system";
@@ -21,42 +19,6 @@ pub fn is_systemd() -> bool {
     Path::new(SYSTEMD_RUNTIME_MARKER).is_dir()
 }
 
-/// Reload `sshd` so a new configuration takes effect.
-///
-/// # Errors
-///
-/// Always returns [`Error::Unsupported`] in this build: reloading `sshd` is not
-/// yet enabled. The wrapper exists to fix the architecture; it performs no
-/// action.
-pub fn reload_sshd() -> Result<()> {
-    tracing::debug!("reload_sshd called but is not enabled in this build");
-    Err(Error::Unsupported)
-}
-
-/// Restart `sshd`.
-///
-/// # Errors
-///
-/// Always returns [`Error::Unsupported`] in this build: restarting `sshd` is not
-/// yet enabled. The wrapper exists to fix the architecture; it performs no
-/// action.
-pub fn restart_sshd() -> Result<()> {
-    tracing::debug!("restart_sshd called but is not enabled in this build");
-    Err(Error::Unsupported)
-}
-
-/// Verify that `sshd` is active and accepted its (re)loaded configuration.
-///
-/// # Errors
-///
-/// Always returns [`Error::Unsupported`] in this build: querying the service
-/// manager is not yet enabled. The wrapper exists to fix the architecture; it
-/// performs no action.
-pub fn verify_sshd_active() -> Result<()> {
-    tracing::debug!("verify_sshd_active called but is not enabled in this build");
-    Err(Error::Unsupported)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -66,23 +28,5 @@ mod tests {
     #[test]
     fn is_systemd_matches_marker_directory() {
         assert_eq!(is_systemd(), Path::new(SYSTEMD_RUNTIME_MARKER).is_dir());
-    }
-
-    #[test]
-    fn reload_sshd_is_unsupported() {
-        assert!(matches!(reload_sshd().unwrap_err(), Error::Unsupported));
-    }
-
-    #[test]
-    fn restart_sshd_is_unsupported() {
-        assert!(matches!(restart_sshd().unwrap_err(), Error::Unsupported));
-    }
-
-    #[test]
-    fn verify_sshd_active_is_unsupported() {
-        assert!(matches!(
-            verify_sshd_active().unwrap_err(),
-            Error::Unsupported
-        ));
     }
 }

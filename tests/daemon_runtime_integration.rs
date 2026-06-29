@@ -33,7 +33,9 @@ use mayfly_agent::protocol::ca_bundle::{
     canonical_signing_payload, compute_fingerprint, CaBundleKey, HEADER_IF_NONE_MATCH,
     SIGNATURE_ALGORITHM, SUPPORTED_BUNDLE_VERSION,
 };
-use mayfly_agent::protocol::ca_sync::{CaBundleTransport, CaSyncService, SshdReloader};
+use mayfly_agent::protocol::ca_sync::{
+    BundleApplier, BundleApplyOutcome, CaBundleTransport, CaSyncService,
+};
 use mayfly_agent::protocol::heartbeat::{
     HeartbeatClient, HeartbeatTransport, HttpRequest, HttpResponse,
 };
@@ -151,13 +153,17 @@ impl CaBundleTransport for SimCaTransport {
     }
 }
 
-struct OkReloader;
-impl SshdReloader for OkReloader {
-    fn reload(&self) -> Result<()> {
-        Ok(())
-    }
-    fn verify(&self) -> Result<()> {
-        Ok(())
+/// A mock privileged applier (the `mayfly-helper` stand-in) that records the
+/// last `TrustedUserCAKeys` body it was asked to apply.
+#[derive(Clone)]
+struct OkApplier {
+    applied: Arc<Mutex<Option<String>>>,
+}
+
+impl BundleApplier for OkApplier {
+    fn apply(&self, trusted_ca_keys: &str) -> Result<BundleApplyOutcome> {
+        *self.applied.lock().unwrap() = Some(trusted_ca_keys.to_string());
+        Ok(BundleApplyOutcome::Applied)
     }
 }
 
@@ -236,19 +242,21 @@ fn daemon_loop_heartbeats_syncs_persists_and_stops_on_shutdown() {
         "https://mayfly.example.com".to_string(),
     );
 
-    // CA sync service over a signing server + healthy reloader (full apply).
+    // CA sync service over a signing server + a healthy mock helper (full apply).
     let server = Arc::new(Mutex::new(SimServer::new(7, 1, "ca-01")));
+    let applied = Arc::new(Mutex::new(None));
     let sync = CaSyncService::new(
         SimCaTransport {
             server: server.clone(),
         },
-        OkReloader,
+        OkApplier {
+            applied: applied.clone(),
+        },
         dyn_clock.clone(),
         MachineKeypair::generate().unwrap(),
         "srv_runtime".to_string(),
         "https://mayfly.example.com".to_string(),
         None,
-        p("trusted_user_ca_keys"),
         p("current_generation"),
         p("current_bundle.sha256"),
         p("bundle_signing_key.pub"),
@@ -298,8 +306,14 @@ fn daemon_loop_heartbeats_syncs_persists_and_stops_on_shutdown() {
     // Two heartbeats were sent (t=+10, t=+20).
     assert_eq!(*hb_count.lock().unwrap(), 2, "expected two heartbeats");
 
-    // CA synchronisation applied the bundle: file written, generation persisted.
-    assert!(p("trusted_user_ca_keys").exists());
+    // CA synchronisation applied the bundle via the helper: the rendered body was
+    // delegated to the applier and the generation persisted.
+    assert!(applied
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .contains("mayfly:ca-01"));
     assert_eq!(
         std::fs::read_to_string(p("current_generation"))
             .unwrap()
