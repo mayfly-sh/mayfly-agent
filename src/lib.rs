@@ -63,6 +63,7 @@ pub mod security;
 pub mod service;
 pub mod ssh;
 pub mod state;
+pub mod tls;
 
 #[cfg(test)]
 mod golden_vectors;

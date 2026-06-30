@@ -93,20 +93,32 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     /// Build a transport with the given request `timeout`.
     ///
-    /// When `allow_insecure_tls` is set, certificate validation is disabled —
-    /// this is for local development only and must never be used in production.
+    /// When `tls_ca_path` is set, the referenced PEM CA bundle is trusted in
+    /// addition to the built-in roots (full verification stays enabled — the
+    /// secure way to trust a private CA). When `allow_insecure_tls` is set,
+    /// certificate validation is disabled — for local development only and never
+    /// in production.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::HeartbeatTransport`] if the client cannot be built.
-    pub fn new(timeout: Duration, allow_insecure_tls: bool) -> Result<Self> {
+    /// Returns [`Error::HeartbeatTransport`] if the client cannot be built, or a
+    /// config error if `tls_ca_path` cannot be read or parsed.
+    pub fn new(
+        timeout: Duration,
+        allow_insecure_tls: bool,
+        tls_ca_path: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let user_agent = format!("mayfly-agent/{}", env!("CARGO_PKG_VERSION"));
-        let client = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .user_agent(user_agent)
-            .danger_accept_invalid_certs(allow_insecure_tls)
-            .build()
-            .map_err(|_| Error::HeartbeatTransport)?;
+            .danger_accept_invalid_certs(allow_insecure_tls);
+        if let Some(path) = tls_ca_path {
+            for cert in crate::tls::load_root_certs(path)? {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let client = builder.build().map_err(|_| Error::HeartbeatTransport)?;
         Ok(Self { client })
     }
 }

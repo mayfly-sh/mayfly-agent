@@ -203,6 +203,15 @@ pub struct Config {
     /// Allow plaintext / unverified TLS. **Development only.**
     #[serde(default)]
     pub allow_insecure_tls: bool,
+
+    /// Optional path to a PEM CA bundle to trust for the server's TLS, in
+    /// addition to the built-in WebPKI roots. Use this to pin a private or
+    /// internal CA that issues the Mayfly server's certificate. Certificate
+    /// verification stays fully enabled; this is the **secure** alternative to
+    /// [`allow_insecure_tls`](Config::allow_insecure_tls) (which disables
+    /// verification entirely and must never be used in production).
+    #[serde(default)]
+    pub tls_ca_path: Option<PathBuf>,
 }
 
 fn default_heartbeat() -> Duration {
@@ -332,6 +341,14 @@ impl Config {
         if let Some(v) = get_env(&key("ALLOW_INSECURE_TLS")) {
             self.allow_insecure_tls = parse_bool("allow_insecure_tls", &v)?;
         }
+        if let Some(v) = get_env(&key("TLS_CA_PATH")) {
+            let trimmed = v.trim();
+            self.tls_ca_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(trimmed))
+            };
+        }
         Ok(())
     }
 
@@ -353,6 +370,9 @@ impl Config {
         validate_managed_path("helper_token_path", &self.helper_token_path)?;
         validate_jitter_ratio(self.poll_jitter_ratio)?;
         validate_optional_signing_key(self.bundle_signing_public_key.as_deref())?;
+        if let Some(path) = &self.tls_ca_path {
+            validate_managed_path("tls_ca_path", path)?;
+        }
 
         if self.allow_insecure_tls {
             tracing::warn!(
@@ -609,6 +629,44 @@ mod tests {
     fn rejects_out_of_range_jitter_ratio() {
         let toml = format!("{MINIMAL}\npoll_jitter_ratio = 1.5\n");
         assert!(matches!(load(&toml).unwrap_err(), Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn tls_ca_path_defaults_to_none() {
+        let cfg = load(MINIMAL).unwrap();
+        assert_eq!(cfg.tls_ca_path, None);
+    }
+
+    #[test]
+    fn accepts_absolute_tls_ca_path() {
+        let toml = format!("{MINIMAL}\ntls_ca_path = \"/etc/mayfly-agent/ca.pem\"\n");
+        let cfg = load(&toml).unwrap();
+        assert_eq!(
+            cfg.tls_ca_path,
+            Some(PathBuf::from("/etc/mayfly-agent/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn rejects_relative_tls_ca_path() {
+        let toml = format!("{MINIMAL}\ntls_ca_path = \"ca.pem\"\n");
+        assert!(matches!(load(&toml).unwrap_err(), Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn tls_ca_path_env_override_sets_and_clears() {
+        let with = |k: &str| -> Option<String> {
+            (k == "MAYFLY_AGENT_TLS_CA_PATH").then(|| "/run/mayfly/ca.pem".to_string())
+        };
+        let cfg = Config::from_toml_with_env(MINIMAL, with).unwrap();
+        assert_eq!(cfg.tls_ca_path, Some(PathBuf::from("/run/mayfly/ca.pem")));
+
+        // An explicit empty override clears the pin.
+        let clear =
+            |k: &str| -> Option<String> { (k == "MAYFLY_AGENT_TLS_CA_PATH").then(String::new) };
+        let toml = format!("{MINIMAL}\ntls_ca_path = \"/etc/mayfly-agent/ca.pem\"\n");
+        let cfg = Config::from_toml_with_env(&toml, clear).unwrap();
+        assert_eq!(cfg.tls_ca_path, None);
     }
 
     #[test]

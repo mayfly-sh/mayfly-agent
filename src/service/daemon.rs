@@ -154,8 +154,11 @@ impl Daemon {
             "runtime state recovered; starting workers"
         );
 
-        let hb_transport = ReqwestTransport::new(HTTP_TIMEOUT, config.allow_insecure_tls)?;
-        let ca_transport = ReqwestTransport::new(HTTP_TIMEOUT, config.allow_insecure_tls)?;
+        let tls_ca_path = config.tls_ca_path.as_deref();
+        let hb_transport =
+            ReqwestTransport::new(HTTP_TIMEOUT, config.allow_insecure_tls, tls_ca_path)?;
+        let ca_transport =
+            ReqwestTransport::new(HTTP_TIMEOUT, config.allow_insecure_tls, tls_ca_path)?;
 
         let heartbeat = HeartbeatClient::new(
             hb_transport,
@@ -242,6 +245,7 @@ impl Daemon {
             systemd = systemd::is_systemd(),
             running_as_root,
             allow_insecure_tls = config.allow_insecure_tls,
+            tls_ca_pinned = config.tls_ca_path.is_some(),
             "mayfly-agent starting"
         );
         if running_as_root {
@@ -286,7 +290,11 @@ impl Daemon {
         // Fail fast on a structurally invalid token rather than retrying it.
         validate_token(&token)?;
 
-        let http = ReqwestEnrollmentHttp::new(DEFAULT_ENROLL_TIMEOUT, config.allow_insecure_tls)?;
+        let http = ReqwestEnrollmentHttp::new(
+            DEFAULT_ENROLL_TIMEOUT,
+            config.allow_insecure_tls,
+            config.tls_ca_path.as_deref(),
+        )?;
         let client = HttpEnrollmentClient::new(http, config.server_url.clone());
         let policy = BackoffPolicy::default();
 
