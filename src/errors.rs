@@ -288,6 +288,10 @@ pub enum CaBundleError {
     InvalidTimestamp,
     /// The bundle's validity window has elapsed (`expires_at` is in the past).
     Expired,
+    /// The bundle's validity window has not begun yet (`created_at` is in the
+    /// future beyond the permitted clock-skew grace) — fail closed rather than
+    /// trust a bundle that should not yet exist.
+    NotYetValid,
     /// The detached bundle signature did not verify against the signing key.
     SignatureInvalid,
     /// The bundle signing key differs from the pinned/expected signing key.
@@ -312,6 +316,7 @@ impl fmt::Display for CaBundleError {
             Self::UnsupportedSignatureAlgorithm => "bundle signature algorithm is not supported",
             Self::InvalidTimestamp => "bundle timestamp is missing or invalid",
             Self::Expired => "bundle has expired",
+            Self::NotYetValid => "bundle is not valid yet",
             Self::SignatureInvalid => "bundle signature failed verification",
             Self::SigningKeyMismatch => "bundle signing key does not match the pinned key",
             Self::GenerationRegressed => "bundle generation is older than the applied generation",
@@ -428,6 +433,10 @@ mod tests {
             "bundle fingerprint does not match its contents"
         );
         assert_eq!(CaBundleError::Empty.to_string(), "bundle contains no keys");
+        assert_eq!(
+            CaBundleError::NotYetValid.to_string(),
+            "bundle is not valid yet"
+        );
     }
 
     #[test]

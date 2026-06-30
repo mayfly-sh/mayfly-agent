@@ -58,6 +58,12 @@ pub const SUPPORTED_BUNDLE_VERSION: u32 = 1;
 /// The only bundle signature algorithm this agent accepts.
 pub const SIGNATURE_ALGORITHM: &str = "ssh-ed25519";
 
+/// Clock-skew grace applied to the not-yet-valid (future-bundle) check. Mirrors
+/// the server's ±60s signed-request timestamp tolerance so benign skew does not
+/// reject an otherwise-valid bundle, while a bundle dated far into the future is
+/// rejected fail-closed.
+pub const CLOCK_SKEW_GRACE: time::Duration = time::Duration::seconds(60);
+
 /// Minimum number of keys a valid bundle must contain.
 pub const MIN_KEYS: usize = 1;
 
@@ -250,6 +256,13 @@ impl CaBundle {
         }
         if now >= expires_at {
             return Err(CaBundleError::Expired);
+        }
+        // Fail closed on a not-yet-valid (future) bundle. A small grace absorbs
+        // benign clock skew between server and agent (mirrors the server's ±60s
+        // signed-request skew tolerance) without trusting a bundle dated well
+        // into the future; a falsely-rejected bundle is simply retried next sync.
+        if created_at - now > CLOCK_SKEW_GRACE {
+            return Err(CaBundleError::NotYetValid);
         }
 
         Ok(Self {
@@ -744,6 +757,74 @@ mod tests {
         assert_eq!(
             CaBundle::from_response(raw, now(), None).unwrap_err(),
             CaBundleError::Expired
+        );
+    }
+
+    #[test]
+    fn rejects_not_yet_valid_bundle() {
+        // A correctly-signed bundle whose validity window starts well in the
+        // future (beyond the skew grace) must be rejected fail-closed.
+        let signer = Signer25519::new();
+        let raw = signed_raw(
+            &signer,
+            1,
+            vec![key("ca-01", &pubkey())],
+            now() + time::Duration::hours(1),
+            now() + time::Duration::hours(2),
+        );
+        assert_eq!(
+            CaBundle::from_response(raw, now(), None).unwrap_err(),
+            CaBundleError::NotYetValid
+        );
+    }
+
+    #[test]
+    fn accepts_bundle_created_within_skew_grace() {
+        // A bundle created slightly in the future (within the skew grace) is
+        // accepted, so benign server/agent clock skew does not falsely reject.
+        let signer = Signer25519::new();
+        let raw = signed_raw(
+            &signer,
+            1,
+            vec![key("ca-01", &pubkey())],
+            now() + time::Duration::seconds(30),
+            now() + time::Duration::hours(2),
+        );
+        assert!(CaBundle::from_response(raw, now(), None).is_ok());
+    }
+
+    #[test]
+    fn rejects_lying_fingerprint_even_when_signed() {
+        // A malicious/buggy signer that signs an advertised fingerprint which
+        // does not match the keys must still be rejected (FingerprintMismatch):
+        // the agent independently recomputes the fingerprint from the key set.
+        let signer = Signer25519::new();
+        let keys = vec![key("ca-01", &pubkey())];
+        let created_at = (now() - time::Duration::hours(1)).format(&Rfc3339).unwrap();
+        let expires_at = (now() + time::Duration::hours(1)).format(&Rfc3339).unwrap();
+        let lying_fingerprint = format!("{FINGERPRINT_PREFIX}{}", "0".repeat(64));
+        let payload = canonical_signing_payload(
+            SUPPORTED_BUNDLE_VERSION,
+            1,
+            &lying_fingerprint,
+            &created_at,
+            &expires_at,
+            &keys,
+        );
+        let raw = CaBundleResponse {
+            bundle_version: Some(SUPPORTED_BUNDLE_VERSION),
+            generation: Some(1),
+            fingerprint: Some(lying_fingerprint),
+            created_at: Some(created_at),
+            expires_at: Some(expires_at),
+            keys,
+            signature_algorithm: Some(SIGNATURE_ALGORITHM.to_string()),
+            signature: Some(signer.sign(payload.as_bytes())),
+            bundle_signing_public_key: Some(signer.public_openssh.clone()),
+        };
+        assert_eq!(
+            CaBundle::from_response(raw, now(), None).unwrap_err(),
+            CaBundleError::FingerprintMismatch
         );
     }
 
